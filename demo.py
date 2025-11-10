@@ -18,7 +18,6 @@ import tqdm
 import cv2
 import numpy as np
 import onnxruntime as ort
-# from baidu import demo_pipeline as dpp
 
 from engine.paddleocr import PaddleOcr, AsyncPipelineOCR
 from engine.draw_utils import draw_with_poly_enhanced, draw_ocr
@@ -732,32 +731,101 @@ class ImageViewerApp(QWidget):
         if worker is None:
             print("No OCR workers available")
             return [], [], []
-        
         try:
-            if self.app_mode == "async" and isinstance(worker, AsyncPipelineOCR):
-                results = worker.process_batch([image], timeout=60.0)
-                result = results[0]
-                boxes = result.get('boxes', [])
-                rec_results = result.get('rec_results', [])
-                processed_img = result.get('preprocessed_image', image)
-                rotated_crops = []  # Crops not returned in async mode
-            else:
-                boxes, rotated_crops, rec_results, processed_img = worker(image)
+            boxes, rotated_crops, rec_results, processed_img = worker(image)
             self.performance_widget.update_performance_data(
                 det_npu=worker.detection_time_duration / worker.ocr_run_count,
-                cls_npu=worker.classification_time_duration / worker.ocr_run_count,
-                rec_npu=worker.recognition_time_duration / worker.ocr_run_count,
-                min_rec_npu=worker.min_recognition_time_duration / worker.ocr_run_count
+                cls_npu=worker.classification_time_duration / worker.ori_run_count,
+                rec_npu=worker.recognition_time_duration / worker.crops_run_count,
+                min_rec_npu=worker.min_recognition_time_duration
             )
-            return boxes, rotated_crops, rec_results, processed_img
         except Exception as e:
             print(f"[DEMO] Error during OCR inference: {e}")
             return [], [], [], image
+        return boxes, rotated_crops, rec_results, processed_img
+
+    def ocr_run_batch(self, images, file_paths):
+        """
+        Batch OCR processing for multiple images
+        """
+        worker = self.get_next_worker()
+        if worker is None:
+            print("No OCR workers available")
+            return []
+        
+        try:
+            # Async batch processing
+            results = worker.process_batch(images, timeout=60.0)
+            batch_results = []
+            for i, result in enumerate(results):
+                boxes = result.get('boxes', [])
+                rec_results = result.get('rec_results', [])
+                processed_img = result.get('preprocessed_image', images[i])
+                rotated_crops = []  # Crops not returned in async mode
+                batch_results.append((boxes, rotated_crops, rec_results, processed_img))
+            
+            self.performance_widget.update_performance_data(
+                det_npu=worker.detection_time_duration / worker.ocr_run_count,
+                cls_npu=worker.classification_time_duration / worker.ori_run_count,
+                rec_npu=worker.recognition_time_duration / worker.crops_run_count,
+                min_rec_npu=worker.min_recognition_time_duration
+            )
+        except Exception as e:
+            print(f"[DEMO] Error during batch OCR inference: {e}")
+            return [([], [], [], image) for image in images]
+        
+        return batch_results
     
-    def run_imagelist(self):
-        if self.file_list.count() == 0:
-            print("No image files available for inference.")
+    def _run_async_batch_processing(self):
+        """Process all images in async batch mode"""
+        images = []
+        file_paths = []
+        
+        # Collect all images and file paths
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            file_path = item.data(Qt.ItemDataRole.UserRole)
+            image = cv2.imread(file_path)
+            if image is None:
+                print(f"Failed to load image file: {file_path}")
+                continue
+            images.append(image)
+            file_paths.append(file_path)
+        
+        if not images:
+            print("No valid images to process.")
             return
+        
+        print(f"Processing {len(images)} images in batch mode...")
+        # Process all images in batch
+        batch_results = self.ocr_run_batch(images, file_paths)
+        
+        # Extract results for batch processing
+        org_images = []
+        boxes_list = []
+        rotated_crops_list = []
+        rec_results_list = []
+        
+        for boxes, rotated_crops, rec_results, processed_image in batch_results:
+            org_images.append(processed_image)
+            boxes_list.append(boxes)
+            rotated_crops_list.append(rotated_crops)
+            rec_results_list.append(rec_results)
+        
+        # Batch process images with OCR results
+        result_images = self.ocr2image_batch(org_images, boxes_list, rotated_crops_list, rec_results_list)
+        
+        # Add results to preview queue
+        for i, result_image in enumerate(result_images):
+            preview_image_q.append((copy.deepcopy(result_image), rec_results_list[i], file_paths[i]))
+        
+        # Update last result with the last processed image
+        if result_images:
+            self.last_result_image = result_images[-1]
+            self.last_result_text = rec_results_list[-1]
+
+    def _run_sync_sequential_processing(self):
+        """Process images one by one in sync mode"""
         for i in tqdm.tqdm(range(self.file_list.count())):
             # Get file path from item data instead of text
             item = self.file_list.item(i)
@@ -766,10 +834,21 @@ class ImageViewerApp(QWidget):
             if image is None:
                 self.image_label.setText(f"Failed to load image file: {file_path}")
                 return
-            boxes, crops, rec_results, processed_image = self.ocr_run(image, file_path)
+            boxes, _, rec_results, processed_image = self.ocr_run(image, file_path)
             self.last_result_image = self.ocr2image(processed_image, boxes, boxes, rec_results)
             self.last_result_text = rec_results
             preview_image_q.append((copy.deepcopy(self.last_result_image), rec_results, file_path))
+
+    def run_imagelist(self):
+        if self.file_list.count() == 0:
+            print("No image files available for inference.")
+            return
+        
+        if self.app_mode == "async":
+            self._run_async_batch_processing()
+        else:
+            self._run_sync_sequential_processing()
+        
         self.preview_grid.set_images(preview_image_q)
         
     
@@ -823,13 +902,10 @@ class ImageViewerApp(QWidget):
 
     def ocr2image(self, org_image, boxes:list, rotated_crops:list, rec_results:list):
         from PIL import Image
-        # image = org_image[:, :, ::-1]
         image = cv2.cvtColor(org_image, cv2.COLOR_BGR2RGB)
         ret_boxes = [line['bbox'] for line in rec_results]
         # Extract recognized text and confidence scores from OCR results
-        # rec_results format: [[text, confidence_score], ...]
         txts = [line['text'] for line in rec_results]  # recognized text
-        scores = [line['score'] for line in rec_results]  # confidence scores
         bbox_text_poly_shape_quadruplets = []
         for i in range(len(ret_boxes)):
             bbox_text_poly_shape_quadruplets.append(
@@ -838,12 +914,41 @@ class ImageViewerApp(QWidget):
         im_sample = draw_with_poly_enhanced(image, bbox_text_poly_shape_quadruplets)
         return np.array(im_sample)
 
+    def ocr2image_batch(self, org_images:list, boxes_list:list, rotated_crops_list:list, rec_results_list:list):
+        """
+        Batch processing for ocr2image
+        """
+        batch_results = []
+        
+        for i in range(len(org_images)):
+            org_image = org_images[i]
+            rec_results = rec_results_list[i]
+            
+            image = cv2.cvtColor(org_image, cv2.COLOR_BGR2RGB)
+            ret_boxes = [line['bbox'] for line in rec_results]
+            # Extract recognized text from OCR results
+            txts = [line['text'] for line in rec_results]  # recognized text
+            bbox_text_poly_shape_quadruplets = []
+            for j in range(len(ret_boxes)):
+                bbox_text_poly_shape_quadruplets.append(
+                    ([np.array(ret_boxes[j]).flatten()], txts[j] if j < len(txts) else "", image.shape, image.shape)
+                )
+            im_sample = draw_with_poly_enhanced(image, bbox_text_poly_shape_quadruplets)
+            batch_results.append(np.array(im_sample))
+            
+        return batch_results
+
     def display_image(self, file_path):
         image = cv2.imread(file_path)
         if image is None:
             self.image_label.setText(f"Failed to load image file: {file_path}")
             return
-        boxes, crops, rec_results, processed_image = self.ocr_run(image, file_path)
+        
+        if self.app_mode == "async":
+            batch_results = self.ocr_run_batch([image], [file_path])
+            boxes, crops, rec_results, processed_image = batch_results[0]
+        else:
+            boxes, crops, rec_results, processed_image = self.ocr_run(image, file_path)
         self.last_result_image = self.ocr2image(processed_image, boxes, crops, rec_results)
         self.last_result_text = rec_results
         preview_image_q.append((copy.deepcopy(self.last_result_image), rec_results, file_path))
@@ -853,10 +958,6 @@ class ImageViewerApp(QWidget):
 
     def resizeEvent(self, event):
         if self.image_label.pixmap():
-            if self.file_list.currentItem():
-                # Get file path from item data instead of text
-                item = self.file_list.currentItem()
-                path = item.data(Qt.ItemDataRole.UserRole) if item else None
             self.update_display_from_cached()
             self.preview_grid.set_images(preview_image_q)
         super().resizeEvent(event)
@@ -915,7 +1016,7 @@ if __name__ == "__main__":
             use_doc_preprocessing=True, use_doc_orientation=True
         )]
     else:
-        ocr_workers = [PaddleOcr(det_models, cls_model, rec_models, doc_ori_model, doc_unwarping_model, True) for _ in range(3)]
+        ocr_workers = [PaddleOcr(det_models, cls_model, rec_models, doc_ori_model, doc_unwarping_model, True) for _ in range(1)]
     
     app = QApplication(sys.argv)
     viewer = ImageViewerApp(ocr_workers=ocr_workers, app_version=args.version, app_mode=args.mode)

@@ -542,6 +542,17 @@ def draw_ocr(
     if scores is None:
         scores = [1] * len(boxes)
     box_num = len(boxes)
+    
+    # Ensure image is in the correct format for OpenCV
+    if isinstance(image, np.ndarray):
+        image = image.astype(np.uint8)
+    else:
+        image = np.array(image, dtype=np.uint8)
+    
+    # Make sure the array is contiguous in memory
+    if not image.flags.c_contiguous:
+        image = np.ascontiguousarray(image)
+        
     for i in range(box_num):
         if scores is not None and (scores[i] < drop_score or math.isnan(scores[i])):
             continue
@@ -556,8 +567,7 @@ def draw_ocr(
             # Green color for boxes with recognized text
             box_color = (0, 255, 0)  # BGR format: Green
             thickness = 2
-            
-        image = cv2.polylines(np.array(image), [box], True, box_color, thickness)
+        image = cv2.polylines(image, [box], True, box_color, thickness)
     if txts is not None:
         img = np.array(resize_img(image, input_size=600))
         txt_img = text_visual(

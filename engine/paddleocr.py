@@ -1,3 +1,12 @@
+"""
+PP-OCRv5 Style OCR Engine Implementation
+- Document Preprocessing: Document orientation correction and unwarping 
+- Text Detection: Text region detection
+- Text Classification: Text rotation angle classification 
+- Text Recognition: Text content recognition
+- Sync/Async Pipeline: Synchronous/Asynchronous processing support
+"""
+
 import os
 import sys
 import time
@@ -6,7 +15,7 @@ import threading
 
 from dx_engine import InferenceEngine as IE
 
-from .utils import get_rotate_crop_image, torch_to_numpy, filter_tag_det_res
+from .utils import get_rotate_crop_image, filter_tag_det_res
 from .utils import det_router, rec_router, split_bbox_for_recognition, merge_recognition_results
 
 from typing import List, Tuple, Dict, Optional, Any
@@ -14,7 +23,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import cv2
-import onnxruntime as ort
 import json
 from datetime import datetime
 
@@ -26,10 +34,25 @@ from models.ocr_postprocess import DetPostProcess, ClsPostProcess, RecLabelDecod
 from preprocessing import PreProcessingCompose
 
 class Node():
+    """
+    Base node class for OCR pipeline
+    Base class for each processing stage (Detection, Classification, Recognition)
+    """
     def __init__(self):
+        # Base node class - concrete implementation in subclasses
         pass
     
     def prepare_input(self, inp: np.ndarray) -> np.ndarray:
+        """
+        Prepare input tensor for DXNN model
+        NCHW -> NHWC conversion and ensure memory contiguity
+        
+        Args:
+            inp: Input array (numpy array)
+            
+        Returns:
+            Input array prepared for DXNN model
+        """
         # Thread-safe version using only numpy (no PyTorch)
         if inp.ndim == 3:
             inp = np.expand_dims(inp, 0)
@@ -41,19 +64,32 @@ class Node():
         return inp
     
     def thread_postprocess(self):
+        # Thread post-processing method - currently unused
         return 0
 
 
 class DetectionNode(Node):
+    """
+    Text Region Detection Node (PP-OCRv5 Detection)
+    - Multi-resolution model support (640x640, 960x960)
+    - Automatic model selection based on image size
+    - DBNet-based text detection
+    """
     def __init__(self, models:dict):
+        """
+        Args:
+            models: {resolution: IE_model} dictionary (e.g., {640: model_640, 960: model_960})
+        """
         self.det_model_map: dict = models
 
+        # Create preprocessing pipeline for each resolution
         self.det_preprocess_map = {}
         for res in [640, 960]:
             res_det_preprocess = det_preprocess.copy()
             res_det_preprocess[0]['resize']['size'] = [res, res]
             self.det_preprocess_map[res] = PreProcessingCompose(res_det_preprocess)
 
+        # DBNet post-processing configuration
         self.det_postprocess = DetPostProcess(
             thresh=0.3,
             box_thresh=0.6,
@@ -66,34 +102,45 @@ class DetectionNode(Node):
 
         self.router = det_router
 
-        self.detection_save_dir = "det_debug/"
+        # Debug settings (set to False when not in use)
         self.detection_save_dir = False
         self.counter = 0
         if self.detection_save_dir:
             os.makedirs(self.detection_save_dir, exist_ok=True)
+        self.det_run_count = 0
     
     def __call__(self, img):
-        engine_latency = 0
+        """
+        Perform text region detection on image
+        
+        Args:
+            img: Input image (numpy array)
+            
+        Returns:
+            tuple: (detected_boxes, execution_count)
+        """
         h, w = img.shape[:2]
+        # Model selection based on image size
         mapped_res = self.router(w, h)
         res_preprocess = self.det_preprocess_map[mapped_res]
         res_model = self.det_model_map[mapped_res]
 
-        input = res_preprocess(img)
+        # Preprocessing and inference
+        model_input = res_preprocess(img)
         padding_info = res_preprocess.get_last_padding_info()
-        input = self.prepare_input(input)
-        start_time = time.time()
-        output = res_model.run([input])
-        engine_latency += time.time() - start_time
+        model_input = self.prepare_input(model_input)
+        output = res_model.run([model_input])
         det_output = self.postprocess(output[0], img.shape, padding_info)
+        self.det_run_count += 1
         
+        # Save debug images
         if self.detection_save_dir:
             import os
             save_path = os.path.join(self.detection_save_dir, f"det_{self.counter}.jpg")
             self.counter += 1
             self.draw_detection_boxes(img, det_output, save_path)
         
-        return det_output, engine_latency
+        return det_output, self.det_run_count
     
     def postprocess(self, outputs, image_shape, padding_info=None):
         dt_boxes = self.det_postprocess(outputs, image_shape, padding_info)
@@ -137,39 +184,49 @@ class DetectionNode(Node):
         return draw_img
 
 class ClassificationNode(Node):
+    """
+    Text Orientation Classification Node (PP-OCRv5 Classification)
+    - Determine if text image is rotated 180 degrees
+    - Align detected text regions to correct orientation
+    """
     def __init__(self, model:IE):
+        """
+        Args:
+            model: Text orientation classification model (DXNN IE)
+        """
         self.model = model
         self.cls_preprocess = PreProcessingCompose(cls_preprocess)
         self.cls_postprocess = ClsPostProcess()
+        self.ori_run_count = 0
 
+        # Debug settings (currently unused)
         self.debug_dir = "cls_debug/"
         self.debug_counter = 0
         os.makedirs(self.debug_dir, exist_ok=True)
     
-
-    def prepare_input_onnx(self, inp: np.ndarray) -> np.ndarray:
-        """ONNX 모델을 위한 입력 준비"""
-        if inp.ndim == 3:
-            inp = np.expand_dims(inp, 0)
-        if inp.shape[-1] == 3:  # HWC -> CHW
-            inp = np.transpose(inp, (0, 3, 1, 2))
-        return inp.astype(np.float32)
-    
     def __call__(self, det_outputs:List[np.ndarray]):
+        """
+        Perform orientation classification on detected text images
+        
+        Args:
+            det_outputs: List of detected text images
+            
+        Returns:
+            tuple: (classification_results_list, execution_count)
+                classification_results: [[label, confidence], ...] format
+        """
         outputs = []
-        engine_latency = 0
         for det_output in det_outputs:
             cls_input = self.cls_preprocess(det_output)
             cls_input = self.prepare_input(cls_input)
-            start_time = time.time()
             output = self.model.run([cls_input])
-            engine_latency += time.time() - start_time
             label, score = self.cls_postprocess(output[0])[0]
-            
             outputs.append([label, score])
-        return outputs, engine_latency
+            self.ori_run_count += 1
+        return outputs, self.ori_run_count
 
     def save_sample_image(self, image, score):
+        """Save image for debugging purposes"""
         filename = f"sample_{self.debug_counter:06d}_{score}.jpg"
         save_path = os.path.join(self.debug_dir, filename)
         
@@ -178,9 +235,20 @@ class ClassificationNode(Node):
 
 
 class RecognitionNode(Node):
+    """
+    Text Recognition Node (PP-OCRv5 Recognition)
+    - Multi-model support for various aspect ratios of text images
+    - Automatic model selection by ratio: ratio_3, ratio_5, ratio_10, ratio_15, ratio_25, ratio_35
+    - CRNN-based text recognition
+    """
     def __init__(self, models:dict):
+        """
+        Args:
+            models: {ratio_key: IE_model} dictionary
+        """
         self.rec_model_map: dict = models
         
+        # Create preprocessing pipeline for each ratio
         self.rec_preprocess_map = {}
 
         ratio_rec_preprocess = rec_preprocess.copy()
@@ -190,28 +258,32 @@ class RecognitionNode(Node):
             ratio_rec_preprocess[0]['resize']['size'] = [48, 48 * i]
             self.rec_preprocess_map[i] = PreProcessingCompose(ratio_rec_preprocess)
         
+        # Load character dictionary
         txt_file_name = 'model_files/ppocrv5_dict.txt'
         character_dict_path = os.path.join(engine_path, txt_file_name)
         
         self.rec_postprocess = RecLabelDecode(character_dict_path=character_dict_path, use_space_char=True)
         self.router = rec_router
-        self.overlap_ratio = 0.1
-        self.drop = 0.3
+        self.drop = 0.3  # Confidence threshold
+        
+        self.crops_run_count = 0
 
-        self.debug_dir = "rec_debug/"
+        # Debug settings (set to False when not in use)
         self.debug_dir = False
         self.debug_counter = 0
         if self.debug_dir:
             os.makedirs(self.debug_dir, exist_ok=True)
 
     def split_bbox_for_recognition(self, bbox, rec_image_shape, overlap_ratio=0.1):
+        """Split long text boxes into multiple parts"""
         return split_bbox_for_recognition(bbox, rec_image_shape, overlap_ratio)
     
     def merge_recognition_results(self, split_results, overlap_ratio=0.1):
+        """Merge split recognition results"""
         return merge_recognition_results(split_results, overlap_ratio)
     
     def classify_ratio(self, width, height):
-        """Classify image by W/H ratio into buckets: ≤3, ≤5, ≤15, >15"""
+        """Classify by width/height ratio: ≤3, ≤5, ≤15, >15"""
         ratio = width / height if height > 0 else float('inf')
         
         if ratio <= 4:
@@ -226,53 +298,42 @@ class RecognitionNode(Node):
             return "ratio_25"
     
     def classify_height(self, height):
-        """Classify image by height: 20 or >20"""
+        """Classify by image height: 20 or below vs above"""
         if height <= 10:
             return "width_20"
         else:
             return "width_40"
     
-    def save_sample_image(self, image, width, height):
-        """Save sample image to appropriate directory based on W/H ratio and height classification"""
-        # Generate filename with counter
+    def save_sample_image(self, image, _width, _height):
+        """Save image for debugging purposes"""
         filename = f"rec_{self.debug_counter:06d}.jpg"
         save_path = os.path.join(self.debug_dir, filename)
         
-        # Save image
         cv2.imwrite(save_path, image)
         self.debug_counter += 1
         
     def __call__(self, original_image, boxes:List, crops:List[np.ndarray]):
+        """
+        Perform text content recognition on text images
+        
+        Args:
+            original_image: Original image 
+            boxes: List of text box coordinates
+            crops: List of cropped text images
+            
+        Returns:
+            tuple: (recognition_results_list, execution_count, min_latency)
+        """
         outputs = []
-        engine_latency = 0
         min_latency = 10000000
         for i in range(len(crops)):
-            h, w = crops[i].shape[:2]
-            
-            bbox = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
-            
-            split_info = []
-            img_crop_list = []
-
-            # split_bboxes = self.split_bbox_for_recognition(bbox, [3, 48, 48 * 30], overlap_ratio=self.overlap_ratio)
-            
-            # split_info.append(len(split_bboxes))
-            # for split_bbox in split_bboxes:
-            #     split_bbox = np.array(split_bbox, dtype=np.float32)
-            #     x1, y1 = split_bbox[0]
-            #     x2, y2 = split_bbox[2]
-            #     split_img = crops[i][int(y1):int(y2), int(x1):int(x2)]
-            #     img_crop_list.append(split_img)
-
-            # rec_res = []
-            # for idx in range(len(img_crop_list)):
-
-            cropped_img = crops[i]  # img_crop_list[idx]
-            # self.save_sample_image(cropped_img, *cropped_img.shape[-2:])
+            cropped_img = crops[i]
+            # Model selection based on image ratio
             mapped_ratio = self.router(cropped_img.shape[1], cropped_img.shape[0])
             ratio_preprocess = self.rec_preprocess_map[mapped_ratio]
             ratio_model = self.rec_model_map[mapped_ratio]
 
+            # Preprocessing and inference
             inp = ratio_preprocess(cropped_img)
             rec_input = self.prepare_input(inp)
 
@@ -283,127 +344,123 @@ class RecognitionNode(Node):
             if min_latency > end_time - start_time:
                 min_latency = end_time - start_time
             res = self.rec_postprocess(output[0])[0]
-            engine_latency += end_time - start_time
-            # if res[1] > self.drop:
-            #     rec_res.append(res)
-
-            # merged_text, merged_score = self.merge_recognition_results(rec_res, overlap_ratio=self.overlap_ratio)
-            # merged_res = [(merged_text, merged_score)]
+            self.crops_run_count += 1
+            
+            # Filter by confidence threshold and save results
             if res[1] > self.drop:
-                # Include bbox index and bbox coordinates with recognition result
                 outputs.append({
                     'bbox_index': i,
                     'bbox': boxes[i],
                     'text': res[0],
                     'score': res[1]
                 })
-        return outputs, engine_latency, min_latency
+        return outputs, self.crops_run_count, min_latency
 
 
 class DocumentOrientationNode(Node):
+    """
+    Document Orientation Correction Node (Document Orientation)
+    - Detect document image rotation angle (0°, 90°, 180°, 270°)
+    - First stage of PP-OCRv5 Document Preprocessing pipeline
+    """
     def __init__(self, model: IE):
-        self.model = model  # DXNN 모델 (주석 처리)
+        """
+        Args:
+            model: Document orientation classification model (DXNN IE)
+        """
+        self.model = model
         self.preprocess = PreProcessingCompose(doc_ori_preprocess)
         self.doc_postprocess = DocOriPostProcess(label_list=['0', '90', '180', '270'])
-        
-        # ONNX 모델 로딩
-        # onnx_model_path = "/home/jhsong04/WORK/PP-OCRv5-DeepX-Baseline-main/engine/model_files/v5/doc_ori.onnx"
-        # self.onnx_session = ort.InferenceSession(onnx_model_path)
-        # self.input_name = self.onnx_session.get_inputs()[0].name
-        # self.output_names = [output.name for output in self.onnx_session.get_outputs()]
 
-    def prepare_input_onnx(self, inp: np.ndarray) -> np.ndarray:
-        """ONNX 모델을 위한 입력 준비"""
-        if inp.ndim == 3:
-            inp = np.expand_dims(inp, 0)
-        # ONNX는 보통 NCHW 형태를 기대하므로 변환
-        if inp.shape[-1] == 3:  # HWC -> CHW
-            inp = np.transpose(inp, (0, 3, 1, 2))
-        return inp.astype(np.float32)
-    
     def __call__(self, image: np.ndarray) -> Tuple[List[Tuple[int, np.ndarray]], float]:
+        """
+        Analyze document image orientation and rotate to correct direction
+        
+        Args:
+            image: Input document image
+            
+        Returns:
+            tuple: ((rotation_angle, rotated_image), processing_time)
+        """
         engine_latency = 0
         
         preprocessed = self.preprocess(image)
-        # preprocessed = self.prepare_input_onnx(preprocessed)
+        preprocessed = self.prepare_input(preprocessed)
         start_time = time.time()
         
-        # DXNN inference (주석 처리)
+        # DXNN inference
         output = self.model.run([preprocessed])[0]
-        
-        # ONNX inference
-        # onnx_outputs = self.onnx_session.run(self.output_names, {self.input_name: preprocessed})
-        # output = onnx_outputs[0]
         
         engine_latency += time.time() - start_time
         
         angle, rotated_image = self.postprocess(output, image)
         return (angle, rotated_image), engine_latency
 
-    
     def postprocess(self, output: np.ndarray, original_image: np.ndarray) -> Tuple[int, np.ndarray]:
+        """Post-processing: Rotate image by predicted angle"""
         doc_ori_results = self.doc_postprocess(output)[0]  # [(label, score), ...]
-        label, score = doc_ori_results
+        label, _ = doc_ori_results
         rotated_image = self.rotate_image(original_image, label)
         
         return label, rotated_image
     
     def rotate_image(self, image: np.ndarray, angle: int) -> np.ndarray:
-        h, w = image.shape[:2]
+        """Rotate image by given angle"""
+        _ = image.shape[:2]  # height, width (unused)
         
-        if angle == "0":
+        if str(angle) == "0":
             return image.copy()
-        elif angle == "90":
+        elif str(angle) == "90":
             return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        elif angle == "180":
+        elif str(angle) == "180":
             return cv2.rotate(image, cv2.ROTATE_180)
-        elif angle == "270":
+        elif str(angle) == "270":
             return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
         else:
             return image.copy()
 
 
 class DocumentUnwarpingNode(Node):
+    """
+    Document Unwarping Correction Node (Document Unwarping - UVDoc)
+    - Correct warped document images to flat form
+    - Second stage of PP-OCRv5 Document Preprocessing pipeline
+    - Uses UVDoc algorithm
+    """
     def __init__(self, model: IE):
+        """
+        Args:
+            model: Document unwarping correction model (UVDoc DXNN IE)
+        """
         self.model = model
         self.preprocess = PreProcessingCompose(uvdoc_preprocess)
         self.target_size = (712, 488)
-        
-        # onnx_model_path = "/home/jhsong04/WORK/PP-OCRv5-DeepX-Baseline-main/engine/model_files/v5/UVDoc_pruned.onnx"
-        # self.onnx_session = ort.InferenceSession(onnx_model_path)
-        # self.input_name = self.onnx_session.get_inputs()[0].name
-        # self.output_names = [output.name for output in self.onnx_session.get_outputs()]
-
         self.origin_shape = None
     
-    def prepare_input_onnx(self, inp: np.ndarray) -> np.ndarray:
-        """ONNX 모델을 위한 입력 준비"""
-        inp = np.transpose(inp, (1, 2, 0))
-        if inp.ndim == 3:
-            inp = np.expand_dims(inp, 0)
-
-        # ONNX는 보통 NCHW 형태를 기대하므로 변환
-        if inp.shape[-1] == 3:  # HWC -> CHW
-            inp = np.transpose(inp, (0, 3, 1, 2))
-        return inp.astype(np.float32)
-    
     def __call__(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
+        """
+        Correct document image distortion to transform into flat form
+        
+        Args:
+            image: Input document image
+            
+        Returns:
+            tuple: (corrected_image, processing_time)
+        """
         engine_latency = 0
         preprocessed = self.preprocess(image)
-        # preprocessed = self.prepare_input_onnx(preprocessed)
+        preprocessed = self.prepare_input(preprocessed)
 
         start_time = time.time()
         # DXNN inference
         output = self.model.run([preprocessed])[0]
         
-        # ONNX inference
-        # onnx_outputs = self.onnx_session.run(self.output_names, {self.input_name: preprocessed})
-        # output = onnx_outputs[0]
         engine_latency += time.time() - start_time
         unwarped_image = self.postprocess(output, image)
         return unwarped_image, engine_latency
 
     def postprocess(self, uv_map: np.ndarray, original_image: np.ndarray) -> np.ndarray:
+        """Post-processing: Image distortion correction using UV map"""
         orig_h, orig_w = original_image.shape[:2]
         
         if uv_map.ndim == 4:
@@ -434,33 +491,57 @@ class DocumentUnwarpingNode(Node):
             align_corners=align_corners
         )
         
-        # Convert back: [1,C,H,W] -> [H,W,C]
+        # Transform: [1,C,H,W] -> [H,W,C]
         output = output_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
         return output.astype(np.uint8)
 
 class DocumentPreprocessingPipeline:
+    """
+    PP-OCRv5 Style Document Preprocessing Pipeline
+    - Stage 1: Document Orientation (document orientation correction)
+    - Stage 2: Document Unwarping (document distortion correction)
+    - Preprocessing pipeline for improving OCR accuracy
+    """
     def __init__(self, 
                  orientation_model: Optional[IE] = None,
                  unwarping_model: Optional[IE] = None,
                  use_doc_orientation: bool = True,
                  use_doc_unwarping: bool = True):
+        """
+        Args:
+            orientation_model: Document orientation correction model
+            unwarping_model: Document distortion correction model  
+            use_doc_orientation: Whether to use orientation correction
+            use_doc_unwarping: Whether to use distortion correction
+        """
         self.use_doc_unwarping = use_doc_unwarping and unwarping_model is not None
 
         self.orientation_node = DocumentOrientationNode(orientation_model) if use_doc_orientation else None
         self.unwarping_node = DocumentUnwarpingNode(unwarping_model)
 
     def __call__(self, image: np.ndarray) -> Tuple[List[Dict], float]:
+        """
+        Execute document preprocessing pipeline
+        
+        Args:
+            image: Input document image
+            
+        Returns:
+            tuple: (processed_image, total_processing_time)
+        """
         total_latency = 0
         
         current_image = image.copy()
         
+        # Stage 1: Document orientation correction
         if self.orientation_node:
             orientation_results, orientation_latency = self.orientation_node(current_image)
             total_latency += orientation_latency
             
-            angle, rotated_image = orientation_results
+            _, rotated_image = orientation_results
             current_image = rotated_image
 
+        # Stage 2: Document distortion correction
         if self.unwarping_node:
             current_image, unwarping_latency = self.unwarping_node(current_image)
             total_latency += unwarping_latency
@@ -478,14 +559,14 @@ class PaddleOcr():
                  use_doc_preprocessing: bool = True,
                  use_doc_orientation: bool = True):
         '''
-        @brief: PP-OCRv5 스타일의 OCR 엔진 (Document Preprocessing 포함)
+        @brief: PP-OCRv5 style OCR engine (including Document Preprocessing)
         @param:
             det_model: DeepX detection model (single IE or dict of {resolution: IE})
-            cls_model: DeepX classification model (cls.dxnn) - doc_ori 역할도 수행
+            cls_model: DeepX classification model (cls.dxnn) - also serves as doc_ori
             rec_models: DeepX recognition models dict
-            doc_unwarping_model: 문서 왜곡 보정 모델 (UVDoc)
-            use_doc_preprocessing: 문서 전처리 사용 여부 (unwarping)
-            use_doc_orientation: 문서 방향 보정 사용 여부 (doc_ori)
+            doc_unwarping_model: Document distortion correction model (UVDoc)
+            use_doc_preprocessing: Whether to use document preprocessing (unwarping)
+            use_doc_orientation: Whether to use document orientation correction (doc_ori)
         @return:
             None
         '''
@@ -528,17 +609,29 @@ class PaddleOcr():
         self.sample_counter = 0
         self.base_sample_dir = "sampled_dataset/"
         self.doc_preprocessing_time_duration = 0
+        
         self.ocr_run_count = 0
+        self.ori_run_count = 0
+        self.crops_run_count = 0
 
         # self.enable_data_collection()
 
     def __call__(self, img, debug_output_path=None):
         """
-        PP-OCRv5 스타일 OCR 파이프라인 실행
-        1. Document Preprocessing (방향보정 + 왜곡보정) - PP-OCRv5와 동일
-        2. Text Detection
-        3. Text Classification  
-        4. Text Recognition
+        Execute PP-OCRv5 style OCR pipeline
+        
+        Processing order:
+        1. Document Preprocessing (orientation correction + distortion correction) - same as PP-OCRv5
+        2. Text Detection (text region detection)
+        3. Text Classification (text orientation classification)
+        4. Text Recognition (text content recognition)
+        
+        Args:
+            img: Input image (numpy array)
+            debug_output_path: Debug information save path (optional)
+            
+        Returns:
+            tuple: (box_coordinates, cropped_images, recognition_results, preprocessed_image)
         """
         debug_data = {
             'mode': 'sync',
@@ -550,17 +643,16 @@ class PaddleOcr():
         
         processed_img = img
         
-        # 1. Document Preprocessing (PP-OCRv5와 동일한 로직)
+        # 1. Document Preprocessing (same logic as PP-OCRv5)
         if self.doc_preprocessing is not None:
             processed_img, preprocessing_latency = self.doc_preprocessing(img)
             self.doc_preprocessing_time_duration += preprocessing_latency * 1000
             
-        # 2. Text Detection (전처리된 이미지에서 수행)
-        det_outputs, engine_latency = self.detection_node(processed_img)
+        # 2. Text Detection (performed on preprocessed image)
+        det_start_time = time.time()
+        det_outputs, _ = self.detection_node(processed_img)
         boxes = self.sorted_boxes(det_outputs)
-
-        self.detection_time_duration += engine_latency * 1000
-
+        self.ocr_run_count += 1
         # Convert boxes to (n, 4, 2) format if needed
         boxes = self.convert_boxes_to_quad_format(boxes)
         
@@ -584,14 +676,18 @@ class PaddleOcr():
                 h, w = crop.shape[:2]
                 self.save_sample_image(crop, w, h)
         
+        self.detection_time_duration += (time.time() - det_start_time) * 1000
         # If we're collecting dataset and skipping recognition, return early
         if self.data_collection_enabled and self.skip_recognition_for_dataset:
-            self.ocr_run_count += 1
             return [box.tolist() for box in boxes], crops, [], processed_img
         
         boxes = [box.tolist() for box in boxes]
-        cls_results, engine_latency = self.classification_node(crops) # crop 된 이미지를 회전 하는지 유추하는 classification model
-        self.classification_time_duration += engine_latency / len(crops) * 1000
+        
+        # 3. Text Classification (text orientation classification)
+        start_time = time.time()
+        cls_results, _ = self.classification_node(crops) # Infer whether cropped image should be rotated using classification model
+        self.classification_time_duration += (time.time() - start_time) * 1000
+        self.ori_run_count += len(crops)
         
         # Save classification results
         debug_data['classification']['results'] = []
@@ -605,10 +701,13 @@ class PaddleOcr():
             })
             if rotated:
                 crops[i] = cv2.rotate(crops[i], cv2.ROTATE_180)
-                
-        rec_results, engine_latency, min_latency = self.recognition_node(processed_img, boxes, crops)
-        self.recognition_time_duration += engine_latency / len(crops) * 1000
-        self.min_recognition_time_duration += min_latency * 1000
+        
+        # 4. Text Recognition (text content recognition)
+        start_time = time.time()
+        rec_results, _, min_latency = self.recognition_node(processed_img, boxes, crops)
+        self.recognition_time_duration += (time.time() - start_time) * 1000
+        self.min_recognition_time_duration = min_latency * 1000
+        self.crops_run_count += len(crops)
         
         # Save recognition results
         debug_data['recognition']['count'] = len(rec_results)
@@ -626,7 +725,6 @@ class PaddleOcr():
             with open(debug_output_path, 'w', encoding='utf-8') as f:
                 json.dump(debug_data, f, indent=2, ensure_ascii=False)
         
-        self.ocr_run_count += 1
         return boxes, crops, rec_results, processed_img
 
     def rotate_if_vertical(self, crop):
@@ -709,8 +807,16 @@ class PaddleOcr():
     
     @staticmethod
     def sorted_boxes(dt_boxes: np.ndarray) -> List[np.ndarray]:
-        boxes = sorted(dt_boxes, key=lambda x: (x[0][1], x[0][0]))
-        _boxes = list(boxes)
+        """
+        Sort text boxes from top-to-bottom, left-to-right order
+        
+        Args:
+            dt_boxes: Detected text boxes
+            
+        Returns:
+            List of sorted text boxes
+        """
+        _boxes = sorted(dt_boxes, key=lambda x: (x[0][1], x[0][0]))
         for i in range(len(_boxes)-1):
             for j in range(i, -1, -1):
                     if abs(_boxes[j + 1][0][1] - _boxes[j][0][1]) < 10 and (
@@ -799,6 +905,9 @@ class AsyncPipelineOCR:
         self.recognition_node = RecognitionNode(self.rec_models)
         
         self.ocr_run_count = 0
+        self.ori_run_count = 0
+        self.crops_run_count = 0
+        
         self.detection_time_duration = 0
         self.classification_time_duration = 0
         self.recognition_time_duration = 0
@@ -891,6 +1000,9 @@ class AsyncPipelineOCR:
             self.active_jobs[job.job_id] = job
         
         # 3. Submit detection for all jobs
+        self.job_detection_start_time = time.time()
+        self.job_classification_start_time = time.time()
+        self.job_recognition_start_time = time.time()
         for job in jobs:
             self._submit_detection(job)
         
@@ -933,7 +1045,12 @@ class AsyncPipelineOCR:
         # 7. Cleanup
         self.active_jobs.clear()
         
-        # 8. Format results
+        # 8. Update Inference Time Durations
+        self.detection_time_duration += (self.job_detection_end_time - self.job_detection_start_time) * 1000 
+        self.classification_time_duration += (self.job_classification_end_time - self.job_classification_start_time) * 1000
+        self.recognition_time_duration += (self.job_recognition_end_time - self.job_recognition_start_time) * 1000
+        
+        # 9. Format results
         return self._format_results(completed_in_order)
     
     def _submit_detection(self, job: OCRJob):
@@ -951,20 +1068,21 @@ class AsyncPipelineOCR:
         res_model = self.det_models[mapped_res]
         
         # Preprocess
-        input = res_preprocess(img)
+        model_input = res_preprocess(img)
         padding_info = res_preprocess.get_last_padding_info()
-        input = self.detection_node.prepare_input(input)
+        model_input = self.detection_node.prepare_input(model_input)
         
         # Submit async (record inference start time)
         job.timestamps['det_inference_start'] = time.time()
-        res_model.run_async([input], user_arg=(job.job_id, mapped_res, padding_info, 'det'))
+        inference_time = time.time()
+        res_model.run_async([model_input], user_arg=(job.job_id, mapped_res, padding_info, inference_time))
         
         with self.lock:
             self.stats['det_submitted'] += 1
     
     def _on_detection_complete(self, outputs: List[np.ndarray], user_arg: Any) -> int:
         """Callback when detection completes"""
-        job_id, mapped_res, padding_info, stage = user_arg
+        job_id, _, padding_info, _ = user_arg
         
         try:
             with self.lock:
@@ -973,9 +1091,7 @@ class AsyncPipelineOCR:
                     return 0
                 
                 # Calculate inference time and accumulate
-                inference_time = time.time() - job.timestamps.get('det_inference_start', time.time())
-                self.detection_time_duration += inference_time * 1000  # Convert to ms
-                
+                self.job_detection_end_time = time.time()
                 self.stats['det_completed'] += 1
                 job.debug_data['callback_order'].append('det_complete')
             
@@ -1030,6 +1146,8 @@ class AsyncPipelineOCR:
         job.timestamps['cls_start'] = time.time()
         job.state = 'classifying'
         job.expected_cls_count = len(job.crops)
+        if len(job.crops) == 0:
+            self.job_classification_end_time = time.time()
         
         # Submit each crop
         for crop_idx, crop in enumerate(job.crops):
@@ -1042,19 +1160,19 @@ class AsyncPipelineOCR:
                 cls_input = self.classification_node.prepare_input(cls_preprocessed)
                 self.stats['cls_submitted'] += 1
             
-            # Record inference start time
             inference_start_time = time.time()
+            # Record inference start time
             # Submit async (outside lock)
+            self.ori_run_count += 1
             self.cls_model.run_async([cls_input], user_arg=(job.job_id, crop_idx, 'cls', inference_start_time))
     
     def _on_classification_complete(self, outputs: List[np.ndarray], user_arg: Any) -> int:
         """Callback when classification completes"""
-        job_id, crop_idx, stage, inference_start_time = user_arg
+        job_id, crop_idx, _, inference_start_time = user_arg
         all_done = False
-        
         try:
             # Calculate inference time
-            inference_time = time.time() - inference_start_time
+            self.job_classification_end_time = time.time()
             
             # Postprocess (outside lock)
             label, score = self.classification_node.cls_postprocess(outputs[0])[0]
@@ -1064,9 +1182,6 @@ class AsyncPipelineOCR:
                 job = self.active_jobs.get(job_id)
                 if not job:
                     return 0
-                
-                # Accumulate classification inference time
-                self.classification_time_duration += inference_time * 1000  # Convert to ms
                 
                 job.cls_results[crop_idx] = (label, score)
                 job.cls_completed_count += 1
@@ -1175,7 +1290,7 @@ class AsyncPipelineOCR:
                 inference_start_time = time.time()
                 # Submit async
                 ratio_model.run_async([rec_input], user_arg=(job.job_id, crop_idx, 'rec', mapped_ratio, inference_start_time))
-                
+                self.crops_run_count += 1
                 with self.lock:
                     self.stats['rec_submitted'] += 1
             except Exception as e:
@@ -1185,12 +1300,12 @@ class AsyncPipelineOCR:
     
     def _on_recognition_complete(self, outputs: List[np.ndarray], user_arg: Any) -> int:
         """Callback when recognition completes"""
-        job_id, crop_idx, stage, mapped_ratio, inference_start_time = user_arg
+        job_id, crop_idx, _, _, inference_start_time = user_arg
+        self.job_recognition_end_time = time.time()
         
         try:
             # Calculate inference time
             inference_time = time.time() - inference_start_time
-            
             # Postprocess (outside lock)
             res = self.recognition_node.rec_postprocess(outputs[0])[0]  # (text, score)
             text, score = res
@@ -1207,8 +1322,6 @@ class AsyncPipelineOCR:
                         print(f"[DEBUG] Job {job_id} not found in active_jobs!")
                     return 0
                 
-                # Accumulate recognition inference time
-                self.recognition_time_duration += inference_time * 1000  # Convert to ms
                 # Update minimum recognition time
                 min_time_ms = inference_time * 1000
                 if self.min_recognition_time_duration == 0 or min_time_ms < self.min_recognition_time_duration:
@@ -1331,9 +1444,8 @@ class AsyncPipelineOCR:
     
     @staticmethod
     def sorted_boxes(dt_boxes: np.ndarray) -> List[np.ndarray]:
-        """Sort boxes from top-to-bottom, left-to-right"""
-        boxes = sorted(dt_boxes, key=lambda x: (x[0][1], x[0][0]))
-        _boxes = list(boxes)
+        """Sort text boxes from top-to-bottom, left-to-right order"""
+        _boxes = sorted(dt_boxes, key=lambda x: (x[0][1], x[0][0]))
         for i in range(len(_boxes)-1):
             for j in range(i, -1, -1):
                 if abs(_boxes[j + 1][0][1] - _boxes[j][0][1]) < 10 and (_boxes[j + 1][0][0] < _boxes[j][0][0]):
@@ -1384,3 +1496,51 @@ class AsyncPipelineOCR:
         print(f"Avg recognition per inference: {stats['avg_recognition_per_inference_ms']:.2f} ms")
         print(f"Stats: {self.stats}")
         print("=========================================\n")
+
+"""
+=== PP-OCRv5 DXNN OCR Engine Main Functions and Features Summary ===
+
+Main Classes:
+1. Node: OCR pipeline base node class
+2. DetectionNode: Text region detection (multi-resolution support: 640x640, 960x960)
+3. ClassificationNode: Text orientation classification (180-degree rotation detection)
+4. RecognitionNode: Text content recognition (multi-ratio models: ratio_3~35)
+5. DocumentOrientationNode: Document orientation correction (0°, 90°, 180°, 270°)
+6. DocumentUnwarpingNode: Document distortion correction (UVDoc algorithm)
+7. DocumentPreprocessingPipeline: Document preprocessing pipeline
+8. PaddleOcr: Main OCR engine (synchronous processing)
+9. AsyncPipelineOCR: Asynchronous OCR pipeline (callback-based)
+
+Processing Pipeline:
+1. Document Preprocessing (optional)
+   - Document Orientation: Document rotation angle correction
+   - Document Unwarping: Document distortion correction (UVDoc)
+2. Text Detection: DBNet-based text region detection
+3. Text Classification: Text image rotation detection
+4. Text Recognition: CRNN-based text content recognition
+
+Model Selection Logic:
+- Detection: Select 640x640 or 960x960 model based on image size
+- Recognition: Automatically select appropriate model based on text aspect ratio
+  * ratio_3: ratio ≤ 4
+  * ratio_5: 4 < ratio ≤ 10  
+  * ratio_10: 10 < ratio ≤ 12.5
+  * ratio_15: 12.5 < ratio ≤ 25
+  * ratio_25: ratio > 25
+
+Key Features:
+- Synchronous/asynchronous processing mode support
+- Debug image saving functionality
+- Performance statistics and timing analysis
+- Batch processing support (asynchronous)
+- JSON format debug data output
+
+Usage Examples:
+# Synchronous processing
+ocr = PaddleOcr(det_models, cls_model, rec_models, doc_ori_model, uvdoc_model)
+boxes, crops, results, processed_img = ocr(image)
+
+# Asynchronous batch processing  
+async_ocr = AsyncPipelineOCR(det_models, cls_model, rec_models, doc_ori_model, uvdoc_model)
+results = async_ocr.process_batch(images, timeout=60.0)
+"""

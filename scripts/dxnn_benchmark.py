@@ -16,6 +16,7 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 import argparse
 import statistics
+import dataclasses
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import unicodedata
@@ -30,84 +31,431 @@ except ImportError:
     calculate_research_standard_accuracy = None
 
 
+@dataclasses.dataclass
+class BenchmarkConfig:
+    """Configuration for OCR benchmark tool"""
+    # Processing parameters
+    workers: int = 1
+    runs_per_image: int = 3
+    mode: str = 'sync'  # 'sync' or 'async'
+    async_batch_size: int = 50
+    
+    # Model parameters
+    disable_doc_ori: bool = False
+    random_rotate: bool = False
+    model_dir: str = 'engine/model_files/best'
+    
+    # Thresholds
+    confidence_threshold: float = 0.3
+    
+    # Performance settings
+    timeout: float = 60.0
+    
+    def __post_init__(self):
+        """Validate configuration"""
+        if self.mode not in ['sync', 'async']:
+            raise ValueError(f"Invalid mode: {self.mode}. Must be 'sync' or 'async'")
+        if self.runs_per_image < 1:
+            raise ValueError(f"runs_per_image must be >= 1, got {self.runs_per_image}")
+        if self.async_batch_size < 1:
+            raise ValueError(f"async_batch_size must be >= 1, got {self.async_batch_size}")
+
+
+class BenchmarkReporter:
+    """Handles result analysis, visualization, and report generation"""
+    
+    def __init__(self, config: BenchmarkConfig):
+        self.config = config
+    
+    def generate_summary_report(self, results: List[Dict], batch_metrics: Dict) -> Dict:
+        """
+        Generate comprehensive summary report
+        
+        Args:
+            results: List of individual image results
+            batch_metrics: Batch-level timing metrics
+            
+        Returns:
+            Summary statistics dictionary
+        """
+        successful_results = [r for r in results if r['success']]
+        
+        if not successful_results:
+            return {
+                'error': 'No successful results to analyze',
+                'total_images': len(results),
+                'successful_images': 0,
+                'failed_images': len(results),
+                'success_rate_percent': 0.0
+            }
+        
+        # Calculate performance statistics
+        # Support both sync format (avg_inference_ms) and async format (inference_time_ms)
+        inference_times = [r.get('avg_inference_ms', r.get('inference_time_ms', 0)) for r in successful_results]
+        fps_values = [r['fps'] for r in successful_results]
+        cps_values = [r.get('chars_per_second', r.get('characters_per_second', 0)) for r in successful_results]
+        char_counts = [r.get('total_chars', r.get('total_characters', 0)) for r in successful_results]
+        
+        # Calculate accuracy statistics if available
+        accuracy_values = []
+        cer_values = []
+        for r in successful_results:
+            if r.get('accuracy_metrics'):
+                accuracy_values.append(r['accuracy_metrics']['character_accuracy'])
+                cer_values.append(r['accuracy_metrics']['character_error_rate'])
+        
+        summary = {
+            'total_images': len(results),
+            'successful_images': len(successful_results),
+            'failed_images': len(results) - len(successful_results),
+            'success_rate_percent': len(successful_results) / len(results) * 100,
+            
+            # Performance metrics
+            'performance': {
+                'avg_inference_time_ms': statistics.mean(inference_times),
+                'min_inference_time_ms': min(inference_times),
+                'max_inference_time_ms': max(inference_times),
+                'std_inference_time_ms': statistics.stdev(inference_times) if len(inference_times) > 1 else 0.0,
+                
+                'avg_fps': statistics.mean(fps_values),
+                'min_fps': min(fps_values),
+                'max_fps': max(fps_values),
+                
+                'avg_chars_per_second': statistics.mean(cps_values),
+                'min_chars_per_second': min(cps_values),
+                'max_chars_per_second': max(cps_values),
+                
+                'total_characters_detected': sum(char_counts),
+                'avg_characters_per_image': statistics.mean(char_counts),
+            },
+            
+            # Timing information
+            'timing': {
+                'init_time_ms': batch_metrics.get('init_time_ms', 0),
+                'batch_duration_ms': batch_metrics.get('batch_duration_ms', 0),
+                'total_inference_time_ms': sum(inference_times),
+            }
+        }
+        
+        # Add accuracy metrics if available
+        if accuracy_values:
+            summary['accuracy'] = {
+                'avg_character_accuracy_percent': statistics.mean(accuracy_values) * 100,
+                'min_character_accuracy_percent': min(accuracy_values) * 100,
+                'max_character_accuracy_percent': max(accuracy_values) * 100,
+                'avg_character_error_rate_percent': statistics.mean(cer_values) * 100,
+                'min_character_error_rate_percent': min(cer_values) * 100,
+                'max_character_error_rate_percent': max(cer_values) * 100,
+            }
+        
+        return summary
+    
+    def print_summary_report(self, summary: Dict):
+        """Print formatted summary report in PP-OCRv5-Cpp-Baseline style"""
+        print("\n" + "="*100)
+        print("DXNN-OCR BENCHMARK RESULTS (PP-OCRv5-Cpp-Baseline Compatible Format)")
+        print("="*100)
+        
+        print(f"Total Images: {summary['total_images']}")
+        print(f"Successful: {summary['successful_images']}")
+        print(f"Failed: {summary['failed_images']}")
+        print(f"Success Rate: {summary['success_rate_percent']:.1f}%")
+        
+        # Check if we have an error (no successful results)
+        if 'error' in summary:
+            print(f"\n⚠️  {summary['error']}")
+            print("="*100)
+            return
+    
+    def print_pp_ocrv5_style_results(self, results: List[Dict], summary: Dict):
+        """Print detailed results in PP-OCRv5-Cpp-Baseline table format"""
+        successful_results = [r for r in results if r['success']]
+        
+        if not successful_results:
+            print("No successful results to display.")
+            return
+        
+        print("\n**Test Results**:")
+        print("| Filename | Inference Time (ms) | FPS | CPS (chars/s) | Accuracy (%) |")
+        print("|---|---|---|---|---|")
+        
+        # Print each image result
+        for result in successful_results:
+            filename = result['filename']
+            inference_time = result.get('avg_inference_ms', result.get('inference_time_ms', 0))
+            fps = result['fps']
+            cps = result.get('chars_per_second', result.get('characters_per_second', 0))
+            
+            # Get accuracy if available
+            accuracy_str = "N/A"
+            if result.get('accuracy_metrics'):
+                accuracy = result['accuracy_metrics']['character_accuracy'] * 100
+                accuracy_str = f"**{accuracy:.2f}**"
+            
+            # Bold format for CPS to match original style
+            print(f"| `{filename}` | {inference_time:.2f} | {fps:.2f} | **{cps:.2f}** | {accuracy_str} |")
+        
+        # Print average row
+        if 'performance' in summary:
+            perf = summary['performance']
+            avg_accuracy_str = "N/A"
+            if 'accuracy' in summary:
+                avg_accuracy = summary['accuracy']['avg_character_accuracy_percent']
+                avg_accuracy_str = f"**{avg_accuracy:.2f}**"
+            
+            print(f"| **Average** | **{perf['avg_inference_time_ms']:.2f}** | **{perf['avg_fps']:.2f}** | **{perf['avg_chars_per_second']:.2f}** | {avg_accuracy_str} |")
+        
+        print()
+    
+    def print_pp_ocrv5_style_summary(self, summary: Dict):
+        """Print summary statistics in PP-OCRv5 style"""
+        if 'error' in summary:
+            return
+        
+        perf = summary['performance']
+        timing = summary['timing']
+        
+        print("**Performance Summary**:")
+        print(f"- Average Inference Time: **{perf['avg_inference_time_ms']:.2f} ms**")
+        print(f"- Average FPS: **{perf['avg_fps']:.2f}**")
+        print(f"- Average CPS: **{perf['avg_chars_per_second']:.2f} chars/s**")
+        print(f"- Total Characters Detected: **{perf['total_characters_detected']}**")
+        print(f"- Model Initialization Time: **{timing['init_time_ms']:.2f} ms**")
+        print(f"- Total Processing Time: **{timing['batch_duration_ms']:.2f} ms**")
+        
+        if 'accuracy' in summary:
+            acc = summary['accuracy']
+            print(f"- Average Character Accuracy: **{acc['avg_character_accuracy_percent']:.2f}%**")
+        else:
+            print("- Character Accuracy: **N/A** (no ground truth provided)")
+        
+        print(f"- Success Rate: **{summary['success_rate_percent']:.1f}%** ({summary['successful_images']}/{summary['total_images']} images)")
+        print()
+    
+    def save_visualization_results(self, results: List[Dict], output_dir: str):
+        """
+        Generate and save visualization images for OCR results
+        
+        Args:
+            results: Individual image results containing detection data
+            output_dir: Output directory path
+        """
+        vis_dir = os.path.join(output_dir, 'vis')
+        os.makedirs(vis_dir, exist_ok=True)
+        
+        print("\n[VIS] Generating visualization images...")
+        
+        try:
+            # Import visualization functions
+            from engine.draw_utils import draw_ocr
+            import cv2
+            
+            vis_count = 0
+            for result in results:
+                if (result['success']):
+                    
+                    try:
+                        filename = result['filename']
+                        base_name = os.path.splitext(filename)[0]
+                        vis_output_path = os.path.join(vis_dir, f"{base_name}_result.jpg")
+                        # Get detection results
+                        boxes = result.get('detection_boxes', result.get('boxes', []))
+                        texts = result.get('detection_texts', result.get('texts', []))
+                        scores = result.get('detection_scores', result.get('scores', []))
+                        original_image = result.get('original_image', result.get('processed_image'))
+                        
+                        if boxes and len(boxes) > 0:
+                            # Generate visualization using engine's draw function
+                            vis_image = draw_ocr(
+                                image=original_image,
+                                boxes=boxes,
+                                txts=texts if texts else None,
+                                scores=scores if scores else None,
+                                drop_score=self.config.confidence_threshold
+                            )
+                            
+                            # Save visualization image
+                            cv2.imwrite(vis_output_path, vis_image)
+                            vis_count += 1
+                            print(f"  [VIS] Saved: {base_name}_result.jpg")
+                        
+                    except Exception as e:
+                        print(f"  [VIS] Failed to generate visualization for {filename}: {e}")
+                        continue
+            
+            print(f"[VIS] Generated {vis_count} visualization images in {vis_dir}/")
+            
+        except ImportError as e:
+            print(f"[VIS] Visualization not available: {e}")
+        except Exception as e:
+            print(f"[VIS] Visualization generation failed: {e}")
+    
+    def save_results(self, results: List[Dict], summary: Dict, output_dir: str):
+        """
+        Save detailed results and summary to files
+        
+        Args:
+            results: Individual image results
+            summary: Summary statistics
+            output_dir: Output directory path
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create PP-OCRv5 style subdirectories
+        json_dir = os.path.join(output_dir, 'json')
+        vis_dir = os.path.join(output_dir, 'vis')
+        os.makedirs(json_dir, exist_ok=True)
+        os.makedirs(vis_dir, exist_ok=True)
+        
+        # Save detailed results in json subdirectory (exclude large image data)
+        results_file = os.path.join(json_dir, 'benchmark_detailed_results.json')
+        
+        # Clean results for JSON serialization (remove large data)
+        json_safe_results = []
+        for result in results:
+            clean_result = {k: v for k, v in result.items() 
+                          if k not in ['original_image', 'detection_boxes', 'detection_texts', 'detection_scores', 'processed_image']}
+            json_safe_results.append(clean_result)
+        
+        with open(results_file, 'w', encoding='utf-8') as f:
+            json.dump(json_safe_results, f, ensure_ascii=False, indent=2)
+        
+        # Save summary in main output directory (PP-OCRv5 style)
+        summary_file = os.path.join(output_dir, 'benchmark_summary.json')
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        
+        # Save CSV format for easy analysis
+        csv_file = os.path.join(output_dir, 'benchmark_results.csv')
+        with open(csv_file, 'w', encoding='utf-8') as f:
+            # Write header
+            f.write("filename,avg_inference_ms,fps,chars_per_second,total_chars,character_accuracy,character_error_rate\n")
+            
+            # Write data
+            for result in results:
+                if result['success']:
+                    acc_metrics = result.get('accuracy_metrics', {})
+                    accuracy = acc_metrics.get('character_accuracy', '') if acc_metrics else ''
+                    cer = acc_metrics.get('character_error_rate', '') if acc_metrics else ''
+                    
+                    # Support both sync and async format
+                    inference_time = result.get('avg_inference_ms', result.get('inference_time_ms', 0))
+                    cps = result.get('chars_per_second', result.get('characters_per_second', 0))
+                    total_chars = result.get('total_chars', result.get('total_characters', 0))
+                    
+                    f.write(f"{result['filename']},{inference_time:.2f},"
+                           f"{result['fps']:.2f},{cps:.2f},"
+                           f"{total_chars},{accuracy},{cer}\n")
+        
+        # Save PP-OCRv5 style markdown report
+        markdown_file = os.path.join(output_dir, 'DXNN-OCR_benchmark_report.md')
+        self.save_pp_ocrv5_style_markdown(results, summary, markdown_file)
+        
+        # Generate visualization images
+        self.save_visualization_results(results, output_dir)
+        
+        print(f"\n[SAVE] Results saved to {output_dir}/")
+        print("  - Detailed results: json/benchmark_detailed_results.json")
+        print("  - Summary: benchmark_summary.json") 
+        print("  - CSV format: benchmark_results.csv")
+        print("  - PP-OCRv5 style report: DXNN-OCR_benchmark_report.md")
+        print("  - Visualization images: vis/")
+    
+    def save_pp_ocrv5_style_markdown(self, results: List[Dict], summary: Dict, output_file: str):
+        """Save benchmark results in PP-OCRv5-Cpp-Baseline markdown format"""
+        successful_results = [r for r in results if r['success']]
+        
+        if not successful_results:
+            return
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("# DXNN-OCR Benchmark Report\n\n")
+            
+            # Test Configuration
+            f.write("**Test Configuration**:\n")
+            f.write("- Model: PP-OCR v5 (DEEPX NPU acceleration)\n")
+            f.write(f"- Total Images Tested: {summary['total_images']}\n")
+            f.write(f"- Success Rate: {summary['success_rate_percent']:.1f}%\n\n")
+            
+            # Test Results Table
+            f.write("**Test Results**:\n")
+            f.write("| Filename | Inference Time (ms) | FPS | CPS (chars/s) | Accuracy (%) |\n")
+            f.write("|---|---|---|---|---|\n")
+            
+            # Write each result
+            for result in successful_results:
+                filename = result['filename']
+                inference_time = result.get('avg_inference_ms', result.get('inference_time_ms', 0))
+                fps = result['fps']
+                cps = result.get('chars_per_second', result.get('characters_per_second', 0))
+                
+                accuracy_str = "N/A"
+                if result.get('accuracy_metrics'):
+                    accuracy = result['accuracy_metrics']['character_accuracy'] * 100
+                    accuracy_str = f"**{accuracy:.2f}**"
+                
+                f.write(f"| `{filename}` | {inference_time:.2f} | {fps:.2f} | **{cps:.2f}** | {accuracy_str} |\n")
+            
+            # Average row
+            if 'performance' in summary:
+                perf = summary['performance']
+                avg_accuracy_str = "N/A"
+                if 'accuracy' in summary:
+                    avg_accuracy = summary['accuracy']['avg_character_accuracy_percent']
+                    avg_accuracy_str = f"**{avg_accuracy:.2f}**"
+                
+                f.write(f"| **Average** | **{perf['avg_inference_time_ms']:.2f}** | **{perf['avg_fps']:.2f}** | **{perf['avg_chars_per_second']:.2f}** | {avg_accuracy_str} |\n\n")
+            
+            # Performance Summary
+            f.write("**Performance Summary**:\n")
+            if 'performance' in summary:
+                perf = summary['performance']
+                timing = summary['timing']
+                
+                f.write(f"- Average Inference Time: **{perf['avg_inference_time_ms']:.2f} ms**\n")
+                f.write(f"- Average FPS: **{perf['avg_fps']:.2f}**\n")
+                f.write(f"- Average CPS: **{perf['avg_chars_per_second']:.2f} chars/s**\n")
+                f.write(f"- Total Characters Detected: **{perf['total_characters_detected']}**\n")
+                f.write(f"- Model Initialization Time: **{timing['init_time_ms']:.2f} ms**\n")
+                f.write(f"- Total Processing Time: **{timing['batch_duration_ms']:.2f} ms**\n")
+                
+                if 'accuracy' in summary:
+                    acc = summary['accuracy']
+                    f.write(f"- Average Character Accuracy: **{acc['avg_character_accuracy_percent']:.2f}%**\n")
+                
+                f.write(f"- Success Rate: **{summary['success_rate_percent']:.1f}%** ({summary['successful_images']}/{summary['total_images']} images)\n")
+
+
 class OCRBenchmark:
     """DXNN OCR Benchmark Tool"""
     
-    def __init__(self, workers=1, runs_per_image=3, random_rotate=False, disable_doc_ori=False, mode='sync', async_batch_size=50):
+    def __init__(self, config: BenchmarkConfig):
         """
-        Initialize benchmark tool
+        Initialize benchmark tool with configuration
         
         Args:
-            workers: Number of worker threads
-            runs_per_image: Number of inference runs per image for averaging
-            random_rotate: Whether to randomly rotate input images for robustness testing
-            disable_doc_ori: Whether to disable document orientation correction
-            mode: 'sync' or 'async' pipeline mode
-            async_batch_size: Batch size for async mode processing (default: 50)
+            config: BenchmarkConfig instance containing all parameters
         """
-        self.runs_per_image = runs_per_image
-        self.random_rotate = random_rotate
-        self.disable_doc_ori = disable_doc_ori
-        self.mode = mode
-        self.async_batch_size = async_batch_size
+        self.config = config
         self.results = []
+        self.reporter = BenchmarkReporter(config)
         
-        print(f"[INIT] Initializing DXNN-OCR benchmark (Mode: {mode.upper()})")
-        if random_rotate:
-            print(f"[INIT] Random rotation enabled for robustness testing")
-        if disable_doc_ori:
-            print(f"[INIT] Document orientation correction disabled")
+        print(f"[INIT] Initializing DXNN-OCR benchmark (Mode: {config.mode.upper()})")
+        if config.random_rotate:
+            print("[INIT] Random rotation enabled for robustness testing")
+        if config.disable_doc_ori:
+            print("[INIT] Document orientation correction disabled")
+        
         start_time = time.time()
         
-        use_doc_orientation = not disable_doc_ori
+        use_doc_orientation = not config.disable_doc_ori
         
-        if mode == 'async':
-            # Initialize async pipeline
-            from engine.paddleocr import AsyncPipelineOCR
-            from dx_engine import InferenceEngine as IE
-            
-            model_dir = 'engine/model_files/best'
-            
-            # Load detection models
-            det_640 = IE(f'{model_dir}/det_v5_640.dxnn')
-            det_960 = IE(f'{model_dir}/det_v5_960.dxnn')
-            det_models = {640: det_640, 960: det_960}
-            
-            # Load classification model
-            cls_model = IE(f'{model_dir}/textline_ori.dxnn')
-            
-            # Load recognition models
-            rec_3 = IE(f'{model_dir}/rec_v5_ratio_3.dxnn')
-            rec_5 = IE(f'{model_dir}/rec_v5_ratio_5.dxnn')
-            rec_10 = IE(f'{model_dir}/rec_v5_ratio_10.dxnn')
-            rec_15 = IE(f'{model_dir}/rec_v5_ratio_15.dxnn')
-            rec_25 = IE(f'{model_dir}/rec_v5_ratio_25.dxnn')
-            rec_35 = IE(f'{model_dir}/rec_v5_ratio_35.dxnn')
-            
-            rec_models = {
-                3: rec_3, 5: rec_5, 10: rec_10, 15: rec_15, 25: rec_25, 35: rec_35,
-                'ratio_3': rec_3, 'ratio_5': rec_5, 'ratio_10': rec_10,
-                'ratio_15': rec_15, 'ratio_25': rec_25, 'ratio_35': rec_35
-            }
-            
-            # Load document preprocessing models
-            doc_ori = IE(f'{model_dir}/doc_ori_fixed.dxnn')
-            doc_unwarp = IE(f'{model_dir}/UVDoc_pruned_p3.dxnn')
-            
-            self.ocr_engine = AsyncPipelineOCR(
-                det_models=det_models,
-                cls_model=cls_model,
-                rec_models=rec_models,
-                doc_ori_model=doc_ori,
-                doc_unwarping_model=doc_unwarp,
-                use_doc_preprocessing=True,
-                use_doc_orientation=use_doc_orientation
-            )
+        if config.mode == 'async':
+            self.ocr_engine = self._init_async_engine(use_doc_orientation)
             self.ocr_workers = [self.ocr_engine]  # For compatibility
-            
         else:  # sync mode
             self.ocr_workers = create_ocr_workers(
-                num_workers=workers, 
+                num_workers=config.workers, 
                 use_doc_preprocessing=True,  # unwarping은 항상 활성화
                 use_doc_orientation=use_doc_orientation
             )
@@ -116,6 +464,49 @@ class OCRBenchmark:
         init_time = time.time() - start_time
         print(f"✓ OCR engine initialized successfully in {init_time*1000:.2f} ms")
         self.init_time_ms = init_time * 1000
+    
+    def _init_async_engine(self, use_doc_orientation: bool):
+        """Initialize async pipeline engine"""
+        from engine.paddleocr import AsyncPipelineOCR
+        from dx_engine import InferenceEngine as IE
+        
+        model_dir = self.config.model_dir
+        
+        # Load detection models
+        det_640 = IE(f'{model_dir}/det_v5_640.dxnn')
+        det_960 = IE(f'{model_dir}/det_v5_960.dxnn')
+        det_models = {640: det_640, 960: det_960}
+        
+        # Load classification model
+        cls_model = IE(f'{model_dir}/textline_ori.dxnn')
+        
+        # Load recognition models
+        rec_3 = IE(f'{model_dir}/rec_v5_ratio_3.dxnn')
+        rec_5 = IE(f'{model_dir}/rec_v5_ratio_5.dxnn')
+        rec_10 = IE(f'{model_dir}/rec_v5_ratio_10.dxnn')
+        rec_15 = IE(f'{model_dir}/rec_v5_ratio_15.dxnn')
+        rec_25 = IE(f'{model_dir}/rec_v5_ratio_25.dxnn')
+        rec_35 = IE(f'{model_dir}/rec_v5_ratio_35.dxnn')
+        
+        rec_models = {
+            3: rec_3, 5: rec_5, 10: rec_10, 15: rec_15, 25: rec_25, 35: rec_35,
+            'ratio_3': rec_3, 'ratio_5': rec_5, 'ratio_10': rec_10,
+            'ratio_15': rec_15, 'ratio_25': rec_25, 'ratio_35': rec_35
+        }
+        
+        # Load document preprocessing models
+        doc_ori = IE(f'{model_dir}/doc_ori_fixed.dxnn')
+        doc_unwarp = IE(f'{model_dir}/UVDoc_pruned_p3.dxnn')
+        
+        return AsyncPipelineOCR(
+            det_models=det_models,
+            cls_model=cls_model,
+            rec_models=rec_models,
+            doc_ori_model=doc_ori,
+            doc_unwarping_model=doc_unwarp,
+            use_doc_preprocessing=True,
+            use_doc_orientation=use_doc_orientation
+        )
     
     def apply_random_rotation(self, image: np.ndarray) -> Tuple[np.ndarray, int]:
         """
@@ -223,6 +614,93 @@ class OCRBenchmark:
             'edit_distance': edit_distance
         }
     
+    def _load_and_prepare_image(self, image_path: str, run_number: int) -> Tuple[np.ndarray, int]:
+        """Load image and apply random rotation if configured"""
+        import cv2
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        # Apply random rotation if enabled
+        rotation_angle = 0
+        if self.config.random_rotate:
+            image, rotation_angle = self.apply_random_rotation(image)
+            if run_number == 0:
+                print(f"    [ROTATION] Applied random rotation: {rotation_angle}°", flush=True)
+        
+        return image, rotation_angle
+    
+    def _run_ocr_inference(self, image: np.ndarray) -> Tuple[List, List, List, np.ndarray]:
+        """Run OCR inference on image"""
+        start_time = time.time()
+        
+        # Call appropriate method based on mode
+        if self.config.mode == 'async':
+            # Async mode: use process_batch with single image
+            from engine.paddleocr import AsyncPipelineOCR
+            results = self.ocr_engine.process_batch([image], timeout=self.config.timeout)
+            result = results[0]
+            boxes = result.get('boxes', [])
+            rec_results = result.get('rec_results', [])
+            processed_image = result.get('preprocessed_image', image)
+        else:
+            # Sync mode: use __call__
+            boxes, _, rec_results, processed_image = self.ocr_engine(image)
+        
+        end_time = time.time()
+        inference_ms = (end_time - start_time) * 1000
+        
+        return boxes, rec_results, processed_image, inference_ms
+    
+    def _extract_text_and_detections(self, boxes: List, rec_results: List) -> Tuple[str, int, List, List, List]:
+        """Extract text and detection information from OCR results"""
+        texts = []
+        scores = []
+        valid_boxes = []
+        
+        # Process each detection result
+        if rec_results and isinstance(rec_results[0], dict):
+            # New dictionary format with explicit bbox information
+            for result in rec_results:
+                if result['score'] > self.config.confidence_threshold:
+                    texts.append(result['text'])
+                    scores.append(result['score'])
+                    valid_boxes.append(result['bbox'])
+        else:
+            # Legacy list format: [[text, confidence], ...]
+            for i, result_group in enumerate(rec_results):
+                if result_group and i < len(boxes):
+                    for text, confidence in result_group:
+                        if confidence > self.config.confidence_threshold:
+                            texts.append(text)
+                            scores.append(confidence)
+                            valid_boxes.append(boxes[i])
+        
+        ocr_text = ' '.join(texts)
+        total_chars = len(''.join(texts))
+        
+        return ocr_text, total_chars, valid_boxes, texts, scores
+    
+    def _calculate_accuracy_metrics(self, ocr_text: str, ground_truth: Optional[str], filename: str) -> Optional[Dict]:
+        """Calculate accuracy metrics if ground truth is available"""
+        if not ground_truth:
+            print(f"  [INFO] No ground truth available for {filename}, skipping accuracy calculation")
+            return None
+        
+        if calculate_research_standard_accuracy is not None:
+            try:
+                # Create mock structures for compatibility with calculate_research_standard_accuracy
+                mock_gt = {'document': [{'text': ground_truth}]}
+                mock_ocr = {'rec_texts': [ocr_text]}
+                return calculate_research_standard_accuracy(mock_gt, mock_ocr, debug=False)
+            except Exception as e:
+                print(f"  [WARNING] Accuracy calculation failed: {e}")
+                return None
+        else:
+            print("  [WARNING] Accuracy module not available, fallback to simple accuracy calculation")
+            # Fallback to simple character accuracy
+            return self.calculate_character_accuracy(ground_truth, ocr_text)
+    
     def process_single_image(self, image_path: str, ground_truth: Optional[str] = None) -> Dict:
         """
         Process single image with multiple runs for averaging
@@ -238,98 +716,34 @@ class OCRBenchmark:
         print(f"[PROCESS] Processing {filename}...", flush=True)
         
         inference_times = []
-        total_chars = 0
         ocr_text = ""
-        # Store detection results for visualization (from first run only)
+        total_chars = 0
         detection_boxes = None
         detection_texts = None
         detection_scores = None
         original_image = None
         
         # Run multiple inferences for averaging
-        print(f"  [INFERENCE] Running {self.runs_per_image} iterations for average metrics...", flush=True)
+        print(f"  [INFERENCE] Running {self.config.runs_per_image} iterations for average metrics...", flush=True)
         
-        for run in range(self.runs_per_image):
-            print(f"    [RUN {run+1}/{self.runs_per_image}] Starting inference...", flush=True)
+        for run in range(self.config.runs_per_image):
+            print(f"    [RUN {run+1}/{self.config.runs_per_image}] Starting inference...", flush=True)
             
-            # Load image
-            import cv2
-            image = cv2.imread(image_path)
-            if image is None:
-                raise ValueError(f"Could not load image: {image_path}")
+            # Load and prepare image
+            image, _ = self._load_and_prepare_image(image_path, run)
             
-            # Apply random rotation if enabled
-            rotation_angle = 0
-            if self.random_rotate:
-                image, rotation_angle = self.apply_random_rotation(image)
-                if run == 0:
-                    print(f"    [ROTATION] Applied random rotation: {rotation_angle}°", flush=True)
-            
-            # Save original image for visualization (first run only)
-            if run == 0:
-                original_image = image.copy()
-            
-            start_time = time.time()
-            
-            # Call appropriate method based on mode
-            if self.mode == 'async':
-                # Async mode: use process_batch with single image
-                from engine.paddleocr import AsyncPipelineOCR
-                results = self.ocr_engine.process_batch([image], timeout=60.0)  # type: ignore
-                result = results[0]
-                boxes = result.get('boxes', [])  # Async uses 'boxes' key
-                rec_results = result.get('rec_results', [])
-                processed_image = result.get('processed_image', image)
-                crops = []  # Crops not returned in async mode
-            else:
-                # Sync mode: use __call__
-                boxes, crops, rec_results, processed_image = self.ocr_engine(image)  # type: ignore
-            
-            end_time = time.time()
-            
-            inference_ms = (end_time - start_time) * 1000
+            # Run OCR inference
+            boxes, rec_results, processed_image, inference_ms = self._run_ocr_inference(image)
             inference_times.append(inference_ms)
             
             # Save processed image for visualization (first run only)
             if run == 0:
-                original_image = processed_image.copy()  # Use processed image instead of original
+                original_image = processed_image.copy()
+                # Extract text and detection results from first run
+                ocr_text, total_chars, detection_boxes, detection_texts, detection_scores = \
+                    self._extract_text_and_detections(boxes, rec_results)
             
-            # Extract text and character count from first run, save detection results
-            if run == 0:
-                texts = []
-                scores = []
-                valid_boxes = []
-                
-                # Process each detection result
-                # New format (dict): {'bbox_index': i, 'bbox': box, 'text': text, 'score': score}
-                # This ensures accurate text-bbox matching for visualization
-                if rec_results and isinstance(rec_results[0], dict):
-                    # New dictionary format with explicit bbox information
-                    for result in rec_results:
-                        if result['score'] > 0.3:  # Confidence threshold
-                            texts.append(result['text'])
-                            scores.append(result['score'])
-                            # Use bbox from recognition result for accurate matching
-                            valid_boxes.append(result['bbox'])
-                else:
-                    # Legacy list format: [[text, confidence], ...]
-                    # Less accurate bbox matching (by index)
-                    for i, result_group in enumerate(rec_results):
-                        if result_group and i < len(boxes):
-                            for text, confidence in result_group:
-                                if confidence > 0.3:
-                                    texts.append(text)
-                                    scores.append(confidence)
-                                    valid_boxes.append(boxes[i])
-                
-                ocr_text = ' '.join(texts)
-                # Store for visualization with guaranteed text-bbox correspondence
-                detection_boxes = valid_boxes
-                detection_texts = texts
-                detection_scores = scores
-                total_chars = len(''.join(texts))
-            
-            print(f"    [RUN {run+1}/{self.runs_per_image}] Completed in {inference_ms:.2f} ms", flush=True)
+            print(f"    [RUN {run+1}/{self.config.runs_per_image}] Completed in {inference_ms:.2f} ms", flush=True)
         
         # Calculate average metrics
         avg_inference_ms = statistics.mean(inference_times)
@@ -341,23 +755,7 @@ class OCRBenchmark:
         chars_per_second = (total_chars * 1000.0) / avg_inference_ms if avg_inference_ms > 0 else 0.0
         
         # Calculate accuracy if ground truth is provided
-        # Use same accuracy calculation logic as async mode for fair comparison
-        accuracy_metrics = None
-        if ground_truth and calculate_research_standard_accuracy is not None:
-            try:
-                # Create mock structures for compatibility with calculate_research_standard_accuracy
-                mock_gt = {'document': [{'text': ground_truth}]}
-                mock_ocr = {'rec_texts': [ocr_text]}
-                accuracy_metrics = calculate_research_standard_accuracy(mock_gt, mock_ocr, debug=False)
-            except Exception as e:
-                print(f"  [WARNING] Accuracy calculation failed: {e}")
-                accuracy_metrics = None
-        elif ground_truth and calculate_research_standard_accuracy is None:
-            print(f"  [WARNING] Accuracy module not available, fallback to simple accuracy calculation")
-            # Fallback to simple character accuracy if research module not available (same as async)
-            accuracy_metrics = self.calculate_character_accuracy(ground_truth, ocr_text)
-        else:
-            print(f"  [INFO] No ground truth available for {filename}, skipping accuracy calculation")
+        accuracy_metrics = self._calculate_accuracy_metrics(ocr_text, ground_truth, filename)
         
         result = {
             'filename': filename,
@@ -380,16 +778,22 @@ class OCRBenchmark:
             'success': True
         }
         
-        print(f"  [METRICS] Average inference time: {avg_inference_ms:.2f} ms")
-        print(f"  [METRICS] FPS: {fps:.2f}")
-        print(f"  [METRICS] Characters/second: {chars_per_second:.2f}")
-        print(f"  [METRICS] Total characters detected: {total_chars}")
-        
-        if accuracy_metrics:
-            print(f"  [ACCURACY] Character accuracy: {accuracy_metrics['character_accuracy']*100:.2f}%")
-            print(f"  [ACCURACY] Character error rate: {accuracy_metrics['character_error_rate']*100:.2f}%")
+        # Print metrics
+        self._print_single_image_metrics(result)
         
         return result
+    
+    def _print_single_image_metrics(self, result: Dict):
+        """Print metrics for single image result"""
+        print(f"  [METRICS] Average inference time: {result['avg_inference_ms']:.2f} ms")
+        print(f"  [METRICS] FPS: {result['fps']:.2f}")
+        print(f"  [METRICS] Characters/second: {result['chars_per_second']:.2f}")
+        print(f"  [METRICS] Total characters detected: {result['total_chars']}")
+        
+        if result['accuracy_metrics']:
+            acc = result['accuracy_metrics']
+            print(f"  [ACCURACY] Character accuracy: {acc['character_accuracy']*100:.2f}%")
+            print(f"  [ACCURACY] Character error rate: {acc['character_error_rate']*100:.2f}%")
             
        
     
@@ -404,7 +808,7 @@ class OCRBenchmark:
         Returns:
             List of benchmark results for each image
         """
-        if self.mode == 'async':
+        if self.config.mode == 'async':
             return self.process_batch_async(image_paths, ground_truths)
         else:
             return self.process_batch_sync(image_paths, ground_truths)
@@ -485,7 +889,7 @@ class OCRBenchmark:
         failed_count = 0
         
         # Process in batches for optimal NPU utilization
-        batch_size = self.async_batch_size
+        batch_size = self.config.async_batch_size
         total_batches = (len(image_paths) + batch_size - 1) // batch_size
         
         print(f"[BATCH ASYNC] Using batch size: {batch_size}")
@@ -514,7 +918,7 @@ class OCRBenchmark:
             batch_timings = []
             batch_ocr_results = None
             
-            for run_idx in range(self.runs_per_image):
+            for run_idx in range(self.config.runs_per_image):
                 run_start = time.time()
                 
                 # Process entire batch at once
@@ -546,7 +950,7 @@ class OCRBenchmark:
                 # Extract OCR results
                 boxes = ocr_result.get('boxes', [])
                 rec_results = ocr_result.get('rec_results', [])
-                processed_image = ocr_result.get('processed_image')
+                processed_image = ocr_result.get('preprocessed_image', [])
                 
                 # Combine all text with same confidence filtering as sync mode (score > 0.3)
                 filtered_results = [r for r in rec_results if r.get('score', 0) > 0.3]
@@ -590,7 +994,7 @@ class OCRBenchmark:
                     'texts' : [r.get('text', 0) for r in rec_results],
                     'rec_results': rec_results,
                     'processed_image': processed_image,
-                    'runs': self.runs_per_image,
+                    'runs': self.config.runs_per_image,
                     'timings_ms': batch_timings
                 }
                 
@@ -617,370 +1021,6 @@ class OCRBenchmark:
         }
         
         return results
-    
-    def generate_summary_report(self, results: List[Dict]) -> Dict:
-        """
-        Generate comprehensive summary report
-        
-        Args:
-            results: List of individual image results
-            
-        Returns:
-            Summary statistics dictionary
-        """
-        successful_results = [r for r in results if r['success']]
-        
-        if not successful_results:
-            return {
-                'error': 'No successful results to analyze',
-                'total_images': len(results),
-                'successful_images': 0,
-                'failed_images': len(results),
-                'success_rate_percent': 0.0
-            }
-        
-        # Calculate performance statistics
-        # Support both sync format (avg_inference_ms) and async format (inference_time_ms)
-        inference_times = [r.get('avg_inference_ms', r.get('inference_time_ms', 0)) for r in successful_results]
-        fps_values = [r['fps'] for r in successful_results]
-        cps_values = [r.get('chars_per_second', r.get('characters_per_second', 0)) for r in successful_results]
-        char_counts = [r.get('total_chars', r.get('total_characters', 0)) for r in successful_results]
-        
-        # Calculate accuracy statistics if available
-        accuracy_values = []
-        cer_values = []
-        for r in successful_results:
-            if r.get('accuracy_metrics'):
-                accuracy_values.append(r['accuracy_metrics']['character_accuracy'])
-                cer_values.append(r['accuracy_metrics']['character_error_rate'])
-        
-        summary = {
-            'total_images': len(results),
-            'successful_images': len(successful_results),
-            'failed_images': len(results) - len(successful_results),
-            'success_rate_percent': len(successful_results) / len(results) * 100,
-            
-            # Performance metrics
-            'performance': {
-                'avg_inference_time_ms': statistics.mean(inference_times),
-                'min_inference_time_ms': min(inference_times),
-                'max_inference_time_ms': max(inference_times),
-                'std_inference_time_ms': statistics.stdev(inference_times) if len(inference_times) > 1 else 0.0,
-                
-                'avg_fps': statistics.mean(fps_values),
-                'min_fps': min(fps_values),
-                'max_fps': max(fps_values),
-                
-                'avg_chars_per_second': statistics.mean(cps_values),
-                'min_chars_per_second': min(cps_values),
-                'max_chars_per_second': max(cps_values),
-                
-                'total_characters_detected': sum(char_counts),
-                'avg_characters_per_image': statistics.mean(char_counts),
-            },
-            
-            # Timing information
-            'timing': {
-                'init_time_ms': self.init_time_ms,
-                'batch_duration_ms': getattr(self, 'batch_metrics', {}).get('batch_duration_ms', 0),
-                'total_inference_time_ms': sum(inference_times),
-            }
-        }
-        
-        # Add accuracy metrics if available
-        if accuracy_values:
-            summary['accuracy'] = {
-                'avg_character_accuracy_percent': statistics.mean(accuracy_values) * 100,
-                'min_character_accuracy_percent': min(accuracy_values) * 100,
-                'max_character_accuracy_percent': max(accuracy_values) * 100,
-                'avg_character_error_rate_percent': statistics.mean(cer_values) * 100,
-                'min_character_error_rate_percent': min(cer_values) * 100,
-                'max_character_error_rate_percent': max(cer_values) * 100,
-            }
-        
-        return summary
-    
-    def print_summary_report(self, summary: Dict):
-        """Print formatted summary report in PP-OCRv5-Cpp-Baseline style"""
-        print("\n" + "="*100)
-        print("DXNN-OCR BENCHMARK RESULTS (PP-OCRv5-Cpp-Baseline Compatible Format)")
-        print("="*100)
-        
-        print(f"Total Images: {summary['total_images']}")
-        print(f"Successful: {summary['successful_images']}")
-        print(f"Failed: {summary['failed_images']}")
-        print(f"Success Rate: {summary['success_rate_percent']:.1f}%")
-        
-        # Check if we have an error (no successful results)
-        if 'error' in summary:
-            print(f"\n⚠️  {summary['error']}")
-            print("="*100)
-            return
-        
-        print("\n**Test Results**:")
-        print("| Filename | Inference Time (ms) | FPS | CPS (chars/s) | Accuracy (%) |")
-        print("|---|---|---|---|---|")
-        
-        print("="*100)
-    
-    def print_pp_ocrv5_style_results(self, results: List[Dict], summary: Dict):
-        """Print detailed results in PP-OCRv5-Cpp-Baseline table format"""
-        successful_results = [r for r in results if r['success']]
-        
-        if not successful_results:
-            print("No successful results to display.")
-            return
-        
-        print("\n**Test Results**:")
-        print("| Filename | Inference Time (ms) | FPS | CPS (chars/s) | Accuracy (%) |")
-        print("|---|---|---|---|---|")
-        
-        # Print each image result
-        for result in successful_results:
-            filename = result['filename']
-            inference_time = result.get('avg_inference_ms', result.get('inference_time_ms', 0))
-            fps = result['fps']
-            cps = result.get('chars_per_second', result.get('characters_per_second', 0))
-            
-            # Get accuracy if available
-            accuracy_str = "N/A"
-            if result.get('accuracy_metrics'):
-                accuracy = result['accuracy_metrics']['character_accuracy'] * 100
-                accuracy_str = f"**{accuracy:.2f}**"
-            
-            # Bold format for CPS to match original style
-            print(f"| `{filename}` | {inference_time:.2f} | {fps:.2f} | **{cps:.2f}** | {accuracy_str} |")
-        
-        # Print average row
-        if 'performance' in summary:
-            perf = summary['performance']
-            avg_accuracy_str = "N/A"
-            if 'accuracy' in summary:
-                avg_accuracy = summary['accuracy']['avg_character_accuracy_percent']
-                avg_accuracy_str = f"**{avg_accuracy:.2f}**"
-            
-            print(f"| **Average** | **{perf['avg_inference_time_ms']:.2f}** | **{perf['avg_fps']:.2f}** | **{perf['avg_chars_per_second']:.2f}** | {avg_accuracy_str} |")
-        
-        print()
-    
-    def print_pp_ocrv5_style_summary(self, summary: Dict):
-        """Print summary statistics in PP-OCRv5 style"""
-        if 'error' in summary:
-            return
-        
-        perf = summary['performance']
-        timing = summary['timing']
-        
-        print("**Performance Summary**:")
-        print(f"- Average Inference Time: **{perf['avg_inference_time_ms']:.2f} ms**")
-        print(f"- Average FPS: **{perf['avg_fps']:.2f}**")
-        print(f"- Average CPS: **{perf['avg_chars_per_second']:.2f} chars/s**")
-        print(f"- Total Characters Detected: **{perf['total_characters_detected']}**")
-        print(f"- Model Initialization Time: **{timing['init_time_ms']:.2f} ms**")
-        print(f"- Total Processing Time: **{timing['batch_duration_ms']:.2f} ms**")
-        
-        if 'accuracy' in summary:
-            acc = summary['accuracy']
-            print(f"- Average Character Accuracy: **{acc['avg_character_accuracy_percent']:.2f}%**")
-        else:
-            print(f"- Character Accuracy: **N/A** (no ground truth provided)")
-        
-        print(f"- Success Rate: **{summary['success_rate_percent']:.1f}%** ({summary['successful_images']}/{summary['total_images']} images)")
-        print()
-    
-    def save_visualization_results(self, results: List[Dict], output_dir: str):
-        """
-        Generate and save visualization images for OCR results
-        
-        Args:
-            results: Individual image results containing detection data
-            output_dir: Output directory path
-        """
-        vis_dir = os.path.join(output_dir, 'vis')
-        os.makedirs(vis_dir, exist_ok=True)
-        
-        print(f"\n[VIS] Generating visualization images...")
-        
-        try:
-            # Import visualization functions
-            from engine.draw_utils import draw_ocr
-            import cv2
-            
-            vis_count = 0
-            for result in results:
-                if (result['success']):
-                    
-                    try:
-                        filename = result['filename']
-                        base_name = os.path.splitext(filename)[0]
-                        vis_output_path = os.path.join(vis_dir, f"{base_name}_result.jpg")
-                        
-                        # Get detection results
-                        boxes = result['detection_boxes'] if result.get('detection_boxes') else result['boxes']
-                        texts = result['detection_texts'] if result.get('detection_texts') else result['texts']
-                        scores = result['detection_scores'] if result.get('detection_scores') else result['scores']
-                        original_image = result['original_image'] if result.get('original_image') else cv2.imread(result['image_path'])
-                        
-                        if boxes and len(boxes) > 0:
-                            # Generate visualization using engine's draw function
-                            vis_image = draw_ocr(
-                                image=original_image,
-                                boxes=boxes,
-                                txts=texts if texts else None,
-                                scores=scores if scores else None,
-                                drop_score=0.3  # Same threshold as processing
-                            )
-                            
-                            # Save visualization image
-                            cv2.imwrite(vis_output_path, vis_image)
-                            vis_count += 1
-                            print(f"  [VIS] Saved: {base_name}_result.jpg")
-                        
-                    except Exception as e:
-                        print(f"  [VIS] Failed to generate visualization for {filename}: {e}")
-                        continue
-            
-            print(f"[VIS] Generated {vis_count} visualization images in {vis_dir}/")
-            
-        except ImportError as e:
-            print(f"[VIS] Visualization not available: {e}")
-        except Exception as e:
-            print(f"[VIS] Visualization generation failed: {e}")
-    
-    def save_results(self, results: List[Dict], summary: Dict, output_dir: str):
-        """
-        Save detailed results and summary to files
-        
-        Args:
-            results: Individual image results
-            summary: Summary statistics
-            output_dir: Output directory path
-        """
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Create PP-OCRv5 style subdirectories
-        json_dir = os.path.join(output_dir, 'json')
-        vis_dir = os.path.join(output_dir, 'vis')
-        os.makedirs(json_dir, exist_ok=True)
-        os.makedirs(vis_dir, exist_ok=True)
-        
-        # Save detailed results in json subdirectory (exclude large image data)
-        results_file = os.path.join(json_dir, 'benchmark_detailed_results.json')
-        
-        # Clean results for JSON serialization (remove large data)
-        json_safe_results = []
-        for result in results:
-            clean_result = {k: v for k, v in result.items() 
-                          if k not in ['original_image', 'detection_boxes', 'detection_texts', 'detection_scores']}
-            json_safe_results.append(clean_result)
-        
-        with open(results_file, 'w', encoding='utf-8') as f:
-            json.dump(json_safe_results, f, ensure_ascii=False, indent=2)
-        
-        # Save summary in main output directory (PP-OCRv5 style)
-        summary_file = os.path.join(output_dir, 'benchmark_summary.json')
-        with open(summary_file, 'w', encoding='utf-8') as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
-        
-        # Save CSV format for easy analysis
-        csv_file = os.path.join(output_dir, 'benchmark_results.csv')
-        with open(csv_file, 'w', encoding='utf-8') as f:
-            # Write header
-            f.write("filename,avg_inference_ms,fps,chars_per_second,total_chars,character_accuracy,character_error_rate\n")
-            
-            # Write data
-            for result in results:
-                if result['success']:
-                    acc_metrics = result.get('accuracy_metrics', {})
-                    accuracy = acc_metrics.get('character_accuracy', '') if acc_metrics else ''
-                    cer = acc_metrics.get('character_error_rate', '') if acc_metrics else ''
-                    
-                    # Support both sync and async format
-                    inference_time = result.get('avg_inference_ms', result.get('inference_time_ms', 0))
-                    cps = result.get('chars_per_second', result.get('characters_per_second', 0))
-                    total_chars = result.get('total_chars', result.get('total_characters', 0))
-                    
-                    f.write(f"{result['filename']},{inference_time:.2f},"
-                           f"{result['fps']:.2f},{cps:.2f},"
-                           f"{total_chars},{accuracy},{cer}\n")
-        
-        # Save PP-OCRv5 style markdown report
-        markdown_file = os.path.join(output_dir, 'DXNN-OCR_benchmark_report.md')
-        self.save_pp_ocrv5_style_markdown(results, summary, markdown_file)
-        
-        # Generate visualization images
-        self.save_visualization_results(results, output_dir)
-        
-        print(f"\n[SAVE] Results saved to {output_dir}/")
-        print(f"  - Detailed results: json/benchmark_detailed_results.json")
-        print(f"  - Summary: benchmark_summary.json") 
-        print(f"  - CSV format: benchmark_results.csv")
-        print(f"  - PP-OCRv5 style report: DXNN-OCR_benchmark_report.md")
-        print(f"  - Visualization images: vis/")
-    
-    def save_pp_ocrv5_style_markdown(self, results: List[Dict], summary: Dict, output_file: str):
-        """Save benchmark results in PP-OCRv5-Cpp-Baseline markdown format"""
-        successful_results = [r for r in results if r['success']]
-        
-        if not successful_results:
-            return
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write("# DXNN-OCR Benchmark Report\n\n")
-            
-            # Test Configuration
-            f.write("**Test Configuration**:\n")
-            f.write(f"- Model: PP-OCR v5 (DEEPX NPU acceleration)\n")
-            f.write(f"- Total Images Tested: {summary['total_images']}\n")
-            f.write(f"- Success Rate: {summary['success_rate_percent']:.1f}%\n\n")
-            
-            # Test Results Table
-            f.write("**Test Results**:\n")
-            f.write("| Filename | Inference Time (ms) | FPS | CPS (chars/s) | Accuracy (%) |\n")
-            f.write("|---|---|---|---|---|\n")
-            
-            # Write each result
-            for result in successful_results:
-                filename = result['filename']
-                inference_time = result.get('avg_inference_ms', result.get('inference_time_ms', 0))
-                fps = result['fps']
-                cps = result.get('chars_per_second', result.get('characters_per_second', 0))
-                
-                accuracy_str = "N/A"
-                if result.get('accuracy_metrics'):
-                    accuracy = result['accuracy_metrics']['character_accuracy'] * 100
-                    accuracy_str = f"**{accuracy:.2f}**"
-                
-                f.write(f"| `{filename}` | {inference_time:.2f} | {fps:.2f} | **{cps:.2f}** | {accuracy_str} |\n")
-            
-            # Average row
-            if 'performance' in summary:
-                perf = summary['performance']
-                avg_accuracy_str = "N/A"
-                if 'accuracy' in summary:
-                    avg_accuracy = summary['accuracy']['avg_character_accuracy_percent']
-                    avg_accuracy_str = f"**{avg_accuracy:.2f}**"
-                
-                f.write(f"| **Average** | **{perf['avg_inference_time_ms']:.2f}** | **{perf['avg_fps']:.2f}** | **{perf['avg_chars_per_second']:.2f}** | {avg_accuracy_str} |\n\n")
-            
-            # Performance Summary
-            f.write("**Performance Summary**:\n")
-            if 'performance' in summary:
-                perf = summary['performance']
-                timing = summary['timing']
-                
-                f.write(f"- Average Inference Time: **{perf['avg_inference_time_ms']:.2f} ms**\n")
-                f.write(f"- Average FPS: **{perf['avg_fps']:.2f}**\n")
-                f.write(f"- Average CPS: **{perf['avg_chars_per_second']:.2f} chars/s**\n")
-                f.write(f"- Total Characters Detected: **{perf['total_characters_detected']}**\n")
-                f.write(f"- Model Initialization Time: **{timing['init_time_ms']:.2f} ms**\n")
-                f.write(f"- Total Processing Time: **{timing['batch_duration_ms']:.2f} ms**\n")
-                
-                if 'accuracy' in summary:
-                    acc = summary['accuracy']
-                    f.write(f"- Average Character Accuracy: **{acc['avg_character_accuracy_percent']:.2f}%**\n")
-                
-                f.write(f"- Success Rate: **{summary['success_rate_percent']:.1f}%** ({summary['successful_images']}/{summary['total_images']} images)\n")
 
 
 def load_labels_ground_truth(json_path: str) -> Dict[str, str]:
@@ -1229,27 +1269,30 @@ Examples:
         print("[INFO] No ground truth provided. Only performance metrics will be calculated.")
     
     # Initialize benchmark
-    benchmark = OCRBenchmark(
-        workers=1, 
-        runs_per_image=args.runs, 
-        random_rotate=args.random_rotate,
-        disable_doc_ori=args.disable_doc_ori,
+    config = BenchmarkConfig(
+        workers=1,
+        runs_per_image=args.runs,
         mode=args.mode,
-        async_batch_size=args.async_batch_size
+        async_batch_size=args.async_batch_size,
+        disable_doc_ori=args.disable_doc_ori,
+        random_rotate=args.random_rotate
     )
+    
+    benchmark = OCRBenchmark(config)
     
     # Process images
     results = benchmark.process_batch(image_files, ground_truths)
     
-    # Generate and print summary
-    summary = benchmark.generate_summary_report(results)
-    benchmark.print_summary_report(summary)
-    benchmark.print_pp_ocrv5_style_results(results, summary)
-    benchmark.print_pp_ocrv5_style_summary(summary)
+    # Generate and print summary using reporter
+    reporter = BenchmarkReporter(config)
+    summary = reporter.generate_summary_report(results, benchmark.batch_metrics)
+    reporter.print_summary_report(summary)
+    reporter.print_pp_ocrv5_style_results(results, summary)
+    reporter.print_pp_ocrv5_style_summary(summary)
     
     # Save results if output directory specified
     if args.output:
-        benchmark.save_results(results, summary, args.output)
+        reporter.save_results(results, summary, args.output)
         
         # Save individual OCR results if requested
         if args.save_individual:
@@ -1263,8 +1306,8 @@ Examples:
                     ocr_data = {
                         'filename': filename,
                         'ocr_text': result['ocr_text'],
-                        'total_chars': result['total_chars'],
-                        'avg_inference_ms': result['avg_inference_ms']
+                        'total_chars': result.get('total_chars', result.get('total_characters')),
+                        'avg_inference_ms': result.get('avg_inference_ms', result.get('inference_time_ms'))
                     }
                     
                     with open(ocr_result_file, 'w', encoding='utf-8') as f:
