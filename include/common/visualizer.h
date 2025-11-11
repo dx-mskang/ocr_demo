@@ -30,17 +30,28 @@ public:
                                   int thickness = 2);
 
     /**
-     * @brief 在图像上绘制检测框并标注文本和置信度
+     * @brief 绘制OCR结果（检测框+识别文本）
      * @param image 输入图像
-     * @param boxes 检测框列表（包含识别结果）
-     * @param draw_text 是否绘制识别文本 (默认true)
-     * @param draw_confidence 是否绘制置信度 (默认true)
-     * @return 绘制后的图像
+     * @param boxes 文本框列表
+     * @param draw_text 是否绘制识别文本
+     * @param draw_confidence 是否绘制置信度
+     * @return 可视化结果图像
      */
     static cv::Mat drawOCRResults(const cv::Mat& image,
-                                   const std::vector<TextBox>& boxes,
-                                   bool draw_text = true,
-                                   bool draw_confidence = true);
+                                  const std::vector<TextBox>& boxes,
+                                  bool draw_text = true,
+                                  bool draw_confidence = true);
+
+    /**
+     * @brief 绘制OCR结果（左右拼接版本：左边检测框，右边文字）
+     * @param image 输入图像
+     * @param boxes 文本框列表
+     * @param font_path TrueType字体路径（用于中文显示）
+     * @return 拼接后的可视化结果（宽度为原图2倍）
+     */
+    static cv::Mat drawOCRResultsSideBySide(const cv::Mat& image,
+                                           const std::vector<TextBox>& boxes,
+                                           const std::string& font_path = "");
 
     /**
      * @brief 在图像上绘制单个多边形
@@ -125,6 +136,19 @@ private:
     
     // 辅助函数：计算文本边界框大小
     static cv::Size getTextSize(const std::string& text, double font_scale, int thickness);
+
+    /**
+     * @brief 使用FreeType绘制UTF-8文本到图像
+     * @param img 目标图像
+     * @param text UTF-8编码的文本
+     * @param org 文本起始位置
+     * @param font_path 字体文件路径
+     * @param font_size 字体大小
+     * @param color 文本颜色
+     */
+    static void putTextUTF8(cv::Mat& img, const std::string& text, cv::Point org,
+                           const std::string& font_path, int font_size,
+                           const cv::Scalar& color);
 };
 
 } // namespace ocr

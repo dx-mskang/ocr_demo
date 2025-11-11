@@ -21,26 +21,33 @@
 
 ## 📊 项目进度概览
 
-**整体进度**: 约 35% 完成
+**整体进度**: 约 55% 完成
 
-| 模块 | 进度 | 状态 | 文件数 |
-|------|------|------|--------|
-| 架构搭建 | 100% | ✅ 完成 | 3 个配置文件 |
-| 通用工具 | 100% | ✅ 完成 | 8 个文件 |
-| 图像预处理 | 100% | ✅ 完成 | 2 个文件 |
-| 文本检测 | 100% | ✅ 完成 | 4 个文件 |
-| 文本识别 | 10% | 🔄 进行中 | 1 个文件 |
-| 文本分类 | 0% | ⏳ 待开始 | 0 个文件 |
-| 同步Pipeline | 0% | ⏳ 待开始 | 0 个文件 |
-| 异步Pipeline | 0% | ⏳ 待开始 | 0 个文件 |
-| 测试框架 | 40% | 🔄 部分完成 | 3 个文件 |
+| 模块 | 进度 | 状态 | 文件数 | 测试状态 |
+|------|------|------|--------|----------|
+| 架构搭建 | 100% | ✅ 完成 | 3 个配置文件 | - |
+| 通用工具 | 100% | ✅ 完成 | 8 个文件 | - |
+| 图像预处理 | 100% | ✅ 完成 | 2 个文件 | - |
+| 文本检测 | 100% | ✅ 完成 | 4 个文件 | ✅ 100% |
+| 文本识别 | 100% | ✅ 完成 | 4 个文件 | ✅ 86.3% |
+| 文本分类 | 0% | ⏳ 待开始 | 0 个文件 | - |
+| 同步Pipeline | 0% | ⏳ 待开始 | 0 个文件 | - |
+| 异步Pipeline | 0% | ⏳ 待开始 | 0 个文件 | - |
+| 测试框架 | 60% | 🔄 部分完成 | 4 个文件 | - |
 
 **代码统计**:
-- 头文件: 8 个
-- 源文件: 7 个 (含 CMakeLists.txt)
-- 总代码行数: ~2000+ 行
+- 头文件: 10 个
+- 源文件: 10 个 (含 CMakeLists.txt)
+- 总代码行数: ~2600+ 行
 - 测试图片: 11 张
-- 测试成功率: 100% (Detection)
+- 测试成功率: 100% (Detection), 86.3% (Recognition)
+
+**最新里程碑** (2025-11-11):
+- ✅ Recognition模块完整实现
+- ✅ CTC解码器支持18,385个字符（中英文混合）
+- ✅ 6种宽高比模型自动选择（ratio_3/5/10/15/25/35）
+- ✅ 识别速度: 16.8ms/框（极快！）
+- ✅ 端到端测试: 检测+识别联动测试通过
 
 ---
 
@@ -309,26 +316,40 @@ cv::resize(padded, final, Size(target_size, target_size));   // 再缩放
 - 如果先Resize会导致图像拉伸变形
 - Padding信息用于后续坐标映射回原图
 
-#### 2. DXRT输入格式 🔥
-**错误方式：**
-```cpp
-// ❌ 错误：归一化到float [0,1]
-image.convertTo(normalized, CV_32FC3, 1.0/255.0);
-uint8_t* data = reinterpret_cast<uint8_t*>(normalized.data);
-```
+#### 2. DXRT输入格式 🔥🔥🔥
+**关键发现（2025-11-11验证）：**
 
-**正确方式：**
+**Detection 和 Recognition 使用相同的输入格式！**
+
 ```cpp
-// ✅ 正确：直接使用uint8 [0,255] HWC格式
-cv::Mat image_bgr;  // uint8 HWC
-cv::cvtColor(image, image_bgr, cv::COLOR_BGR2RGB);
+// ✅ 正确：Detection和Recognition都使用 uint8 HWC格式
+cv::Mat image_bgr;  // uint8 HWC, [0, 255]
 engine->Run(image_bgr.data);  // DXRT内部会做归一化
+
+// ❌ 错误：手动归一化
+image.convertTo(normalized, CV_32FC3, 1.0/255.0);  // 不需要！
 ```
 
-**原因：**
-- DXRT期望输入是 uint8 HWC格式
-- 模型内部已包含归一化操作
-- 手动归一化会导致double normalization
+**实测数据：**
+```
+Detection Model (640x640):
+  - Input: uint8 HWC, 640×640×3 = 1,228,800 bytes
+  - No manual normalization needed
+
+Recognition Models:
+  - ratio_3:  uint8 HWC, 48×120×3 = 17,280 bytes ✅
+  - ratio_5:  uint8 HWC, 48×240×3 = 34,560 bytes ✅
+  - ratio_10: uint8 HWC, 48×480×3 = 69,120 bytes ✅
+  - ratio_15: uint8 HWC, 48×720×3 = 103,680 bytes ✅
+  - ratio_25: uint8 HWC, 48×1200×3 = 172,800 bytes ✅
+  - ratio_35: uint8 HWC, 48×1680×3 = 241,920 bytes ✅
+```
+
+**重要结论：**
+- ✅ Python的 `/255` 和 `normalize` 操作被编译到DXNN模型内部
+- ✅ C++实现只需提供 uint8 原始像素即可
+- ✅ 简化了C++实现，与Detection保持一致
+- ⚠️ 确保图像是连续内存（contiguous）
 
 #### 3. 坐标映射算法 🔥
 **关键点：**
@@ -350,6 +371,164 @@ y = std::clamp(y, 0.0f, static_cast<float>(src_h));
 - Padded空间 = 原图 + 黑边padding
 - 原图坐标在padded空间内已经是正确的
 - 只需裁剪掉超出原图部分的点
+
+### 📝 Recognition模块技术细节（2025-11-11确认）
+
+#### 1. Ratio模型选择算法 ✅
+**Python实现**（`utils.py::rec_router`）：
+```python
+def rec_router(width, height):
+    ratio = width / height
+    if ratio <= 3: return 3
+    elif ratio <= 5: return 5
+    elif ratio <= 10: return 10
+    elif ratio <= 15: return 15
+    elif ratio <= 25: return 25
+    else: return 35
+```
+
+**C++实现：**
+```cpp
+int selectRatio(int width, int height) {
+    float ratio = static_cast<float>(width) / height;
+    if (ratio <= 3.0f) return 3;
+    if (ratio <= 5.0f) return 5;
+    if (ratio <= 10.0f) return 10;
+    if (ratio <= 15.0f) return 15;
+    if (ratio <= 25.0f) return 25;
+    return 35;
+}
+```
+
+#### 2. 预处理策略 ✅
+**固定高度，宽度按ratio：**
+```cpp
+// Recognition预处理
+int target_height = 48;  // 固定
+int target_width = 48 * ratio;  // 根据ratio计算
+
+// 各ratio对应宽度：
+// ratio_3:  48 × 2.5 = 120px
+// ratio_5:  48 × 5 = 240px
+// ratio_10: 48 × 10 = 480px
+// ratio_15: 48 × 15 = 720px
+// ratio_25: 48 × 25 = 1200px
+// ratio_35: 48 × 35 = 1680px
+```
+
+**PPOCR Resize过程：**
+1. 计算原图ratio和目标ratio
+2. 如果原图ratio < 目标ratio → 右侧补黑边
+3. 如果原图ratio > 目标ratio → 底部补黑边（少见）
+4. Resize到 [48, target_width]
+
+**输入格式：**
+- ✅ uint8 HWC格式
+- ✅ 值域 [0, 255]
+- ✅ 连续内存（contiguous）
+- ⚠️ 不需要手动归一化！
+
+#### 3. CTC解码算法 ✅
+**字典格式**（`ppocrv5_dict.txt`）：
+```
+字典总大小: 18,385个字符
+索引0: "blank" (CTC空白符)
+索引1-18383: 实际字符（中文、英文、数字、符号等）
+索引18384: " " (空格，use_space_char=True)
+```
+
+**解码流程：**
+```cpp
+// 1. Argmax获取预测索引
+// output shape: [1, time_steps, num_classes]
+// time_steps ≈ width/8 (例如240px → 30 timesteps)
+std::vector<int> pred_indices;
+std::vector<float> pred_probs;
+for (int t = 0; t < time_steps; t++) {
+    int max_idx = argmax(output[t]);
+    float max_prob = output[t][max_idx];
+    pred_indices.push_back(max_idx);
+    pred_probs.push_back(max_prob);
+}
+
+// 2. 去重复（CTC特性）
+std::vector<int> deduped_indices;
+std::vector<float> deduped_probs;
+deduped_indices.push_back(pred_indices[0]);
+deduped_probs.push_back(pred_probs[0]);
+for (int t = 1; t < time_steps; t++) {
+    if (pred_indices[t] != pred_indices[t-1]) {
+        deduped_indices.push_back(pred_indices[t]);
+        deduped_probs.push_back(pred_probs[t]);
+    }
+}
+
+// 3. 去除blank (index=0)
+std::string text;
+std::vector<float> confidences;
+for (size_t i = 0; i < deduped_indices.size(); i++) {
+    if (deduped_indices[i] != 0) {  // 0是blank
+        text += character_dict[deduped_indices[i]];
+        confidences.push_back(deduped_probs[i]);
+    }
+}
+
+// 4. 计算平均置信度
+float avg_confidence = std::accumulate(confidences.begin(), 
+                                       confidences.end(), 0.0f) / confidences.size();
+
+// 5. 置信度过滤
+if (avg_confidence > 0.3f) {  // threshold
+    return {text, avg_confidence};
+}
+```
+
+#### 4. 模型输出格式 ✅
+**实测数据：**
+```
+输入: [1, 48, 240, 3] uint8 HWC
+输出: [1, 30, 18385] float32
+  - batch: 1
+  - time_steps: 30 (≈ width/8)
+  - num_classes: 18385 (字典大小)
+```
+
+**Time steps计算规律：**
+- ratio_3 (120px): ~15 time steps
+- ratio_5 (240px): ~30 time steps
+- ratio_10 (480px): ~60 time steps
+- ratio_15 (720px): ~90 time steps
+- ratio_25 (1200px): ~150 time steps
+- ratio_35 (1680px): ~210 time steps
+
+#### 5. UTF-8字符处理 ⚠️
+**字典包含多种字符：**
+- 中文汉字（CJK）
+- 英文字母
+- 数字
+- 标点符号
+- Emoji（🕟等）
+- 空格
+
+**C++实现注意：**
+```cpp
+// 使用std::string（支持UTF-8）
+std::vector<std::string> character_dict;
+
+// 读取字典文件
+std::ifstream file(dict_path);
+std::string line;
+while (std::getline(file, line)) {
+    // 去除换行符
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    character_dict.push_back(line);
+}
+
+// 添加blank在开头
+character_dict.insert(character_dict.begin(), "blank");
+```
 
 ### 1. DXRT API使用
 
@@ -567,6 +746,16 @@ for(int ratio : {3, 5, 10, 15, 25, 35}) {
 
 ## 📚 参考资源
 
+### Python开发环境
+```bash
+# Python虚拟环境路径
+source ~/Desktop/dx-all-suite/dx-runtime/venv-dx-runtime/bin/activate
+
+# 测试Python OCR
+cd /home/deepx/Desktop/ocr_demo
+python3 main.py --version v5
+```
+
 ### DeepXSharp架构
 - `DeepXSharp/include/detection/yolo.h` - 检测器设计模式
 - `DeepXSharp/src/detection/yolo.cpp` - 实现参考
@@ -581,6 +770,21 @@ for(int ratio : {3, 5, 10, 15, 25, 35}) {
 - `engine/paddleocr.py` - 完整OCR流程
 - `engine/models/ocr_postprocess.py` - 后处理算法
 - `engine/preprocessing/` - 预处理操作
+- `engine/utils.py` - 工具函数（rec_router等）
+
+### 模型文件位置
+```
+ocr_demo/engine/model_files/best/
+├── det_v5_640.dxnn           # Detection 640模型
+├── det_v5_960.dxnn           # Detection 960模型
+├── rec_v5_ratio_3.dxnn       # Recognition ratio_3 (48x120)
+├── rec_v5_ratio_5.dxnn       # Recognition ratio_5 (48x240)
+├── rec_v5_ratio_10.dxnn      # Recognition ratio_10 (48x480)
+├── rec_v5_ratio_15.dxnn      # Recognition ratio_15 (48x720)
+├── rec_v5_ratio_25.dxnn      # Recognition ratio_25 (48x1200)
+├── rec_v5_ratio_35.dxnn      # Recognition ratio_35 (48x1680)
+└── ppocrv5_dict.txt          # 字符字典 (18385个字符)
+```
 
 ## 📝 开发日志
 

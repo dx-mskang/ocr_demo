@@ -8,6 +8,7 @@
 
 #include "common/logger.hpp"
 #include "common/types.hpp"
+#include "recognition/rec_postprocess.h"  // 包含完整定义
 
 namespace DeepXOCR {
 
@@ -72,8 +73,8 @@ private:
     // ratio_3, ratio_5, ratio_10, ratio_15, ratio_25, ratio_35
     std::map<int, std::unique_ptr<dxrt::InferenceEngine>> models_;
     
-    // Character dictionary
-    std::vector<std::string> charDict_;
+    // CTC Decoder
+    std::unique_ptr<ocr::CTCDecoder> decoder_;
     
     // Select appropriate model based on image aspect ratio
     dxrt::InferenceEngine* SelectModel(const cv::Mat& image);
@@ -84,9 +85,6 @@ private:
     
     // Postprocessing (CTC decoding)
     std::pair<std::string, float> Postprocess(dxrt::TensorPtrs& outputs);
-    
-    // Load character dictionary
-    bool LoadDictionary();
 };
 
 } // namespace DeepXOCR

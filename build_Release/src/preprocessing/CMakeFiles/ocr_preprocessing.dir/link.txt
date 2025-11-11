@@ -1,2 +1,0 @@
-/usr/bin/ar qc libocr_preprocessing.a CMakeFiles/ocr_preprocessing.dir/image_ops.cpp.o
-/usr/bin/ranlib libocr_preprocessing.a

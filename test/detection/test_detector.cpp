@@ -48,6 +48,8 @@ int main(int /* argc */, char** /* argv */) {
     config.model960Path = "engine/model_files/best/det_v5_960.dxnn";
     config.thresh = 0.3f;
     config.boxThresh = 0.6f;
+    config.maxCandidates = 1500;  // 与Python保持一致
+    config.unclipRatio = 1.5f;
     config.unclipRatio = 1.5f;
     config.saveIntermediates = false;  // Don't save per-image results
     

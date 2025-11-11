@@ -1,2 +1,0 @@
-/usr/bin/ar qc libocr_utils.a CMakeFiles/ocr_utils.dir/src/common/geometry.cpp.o CMakeFiles/ocr_utils.dir/src/common/visualizer.cpp.o CMakeFiles/ocr_utils.dir/src/preprocessing/image_ops.cpp.o
-/usr/bin/ranlib libocr_utils.a

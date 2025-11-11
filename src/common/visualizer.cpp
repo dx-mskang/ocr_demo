@@ -1,8 +1,12 @@
 #include "common/visualizer.h"
 #include "common/logger.hpp"
 #include <random>
+#include <opencv2/freetype.hpp>
 
 namespace ocr {
+
+// FreeType字体渲染器（全局实例）
+static cv::Ptr<cv::freetype::FreeType2> g_ft2;
 
 cv::Mat Visualizer::drawTextBoxes(const cv::Mat& image,
                                   const std::vector<TextBox>& boxes,
@@ -254,6 +258,98 @@ cv::Size Visualizer::getTextSize(const std::string& text,
     int baseline = 0;
     return cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 
                           font_scale, thickness, &baseline);
+}
+
+void Visualizer::putTextUTF8(cv::Mat& img, const std::string& text, cv::Point org,
+                            const std::string& font_path, int font_size,
+                            const cv::Scalar& color) {
+    // 初始化FreeType（只初始化一次）
+    if (!g_ft2 || g_ft2.empty()) {
+        g_ft2 = cv::freetype::createFreeType2();
+        if (!font_path.empty()) {
+            g_ft2->loadFontData(font_path, 0);
+        }
+    }
+    
+    // 如果提供了新的字体路径，重新加载
+    static std::string current_font_path;
+    if (!font_path.empty() && font_path != current_font_path) {
+        g_ft2->loadFontData(font_path, 0);
+        current_font_path = font_path;
+    }
+    
+    // 绘制UTF-8文本
+    if (g_ft2 && !g_ft2.empty()) {
+        g_ft2->putText(img, text, org, font_size, color, -1, cv::LINE_AA, true);
+    } else {
+        // 回退到普通ASCII绘制
+        cv::putText(img, text, org, cv::FONT_HERSHEY_SIMPLEX, 
+                   font_size / 20.0, color, 2);
+    }
+}
+
+cv::Mat Visualizer::drawOCRResultsSideBySide(const cv::Mat& image,
+                                            const std::vector<TextBox>& boxes,
+                                            const std::string& font_path) {
+    // 获取字体路径（默认使用项目字体）
+    std::string font = font_path.empty() ? 
+                      "engine/fonts/NotoSansCJK-Regular.ttc" : font_path;
+    
+    int h = image.rows;
+    int w = image.cols;
+    
+    // 左图：原图 + 半透明检测框
+    cv::Mat img_left = image.clone();
+    
+    // 右图：白色画布 + 文字
+    cv::Mat img_right = cv::Mat(h, w, CV_8UC3, cv::Scalar(255, 255, 255));
+    
+    // 设置随机种子确保颜色一致
+    std::srand(0);
+    
+    for (const auto& box : boxes) {
+        // 生成随机颜色
+        cv::Scalar color = getRandomColor();
+        
+        // 左图：绘制检测框
+        std::vector<cv::Point> pts;
+        for (int i = 0; i < 4; i++) {
+            pts.push_back(cv::Point(static_cast<int>(box.points[i].x), 
+                                   static_cast<int>(box.points[i].y)));
+        }
+        
+        // 绘制填充多边形（半透明效果）
+        cv::Mat overlay = img_left.clone();
+        std::vector<std::vector<cv::Point>> contours = {pts};
+        cv::fillPoly(overlay, contours, color);
+        cv::addWeighted(overlay, 0.3, img_left, 0.7, 0, img_left);
+        
+        // 绘制边框
+        cv::polylines(img_left, contours, true, color, 2);
+        
+        // 右图：只绘制文字（不绘制框）
+        if (!box.text.empty()) {
+            // 计算文字区域的中心位置和大小
+            cv::Rect bbox = cv::boundingRect(pts);
+            int box_width = bbox.width;
+            int box_height = bbox.height;
+            
+            // 根据框的大小调整字体大小（调小字体：原来是 box_height/2，现在是 box_height/3）
+            int font_size = std::max(12, std::min(box_height / 3, 32));
+            
+            // 绘制文字（使用FreeType支持UTF-8）
+            cv::Point text_pos(bbox.x + 5, bbox.y + bbox.height / 2 + font_size / 3);
+            putTextUTF8(img_right, box.text, text_pos, font, font_size, 
+                       cv::Scalar(0, 0, 0));
+        }
+    }
+    
+    // 拼接左右两图
+    cv::Mat result(h, w * 2, CV_8UC3);
+    img_left.copyTo(result(cv::Rect(0, 0, w, h)));
+    img_right.copyTo(result(cv::Rect(w, 0, w, h)));
+    
+    return result;
 }
 
 } // namespace ocr
