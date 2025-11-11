@@ -1,0 +1,2 @@
+/usr/bin/ar qc libocr_common.a CMakeFiles/ocr_common.dir/geometry.cpp.o CMakeFiles/ocr_common.dir/logger.cpp.o CMakeFiles/ocr_common.dir/visualizer.cpp.o
+/usr/bin/ranlib libocr_common.a

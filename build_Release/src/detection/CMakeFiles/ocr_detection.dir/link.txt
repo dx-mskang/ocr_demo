@@ -1,0 +1,2 @@
+/usr/bin/ar qc libocr_detection.a CMakeFiles/ocr_detection.dir/db_postprocess.cpp.o CMakeFiles/ocr_detection.dir/text_detector.cpp.o
+/usr/bin/ranlib libocr_detection.a
