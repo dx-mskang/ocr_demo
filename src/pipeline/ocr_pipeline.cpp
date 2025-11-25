@@ -123,9 +123,14 @@ OCRPipeline::OCRPipeline(const OCRPipelineConfig& config)
     : config_(config), initialized_(false) {
     // Get CPU core count for thread pool sizing
     unsigned int numCores = std::thread::hardware_concurrency();
-    
-    numDetectionThreads_ = std::max(1u, numCores );
-    numRecognitionThreads_ = std::max(1u, numCores );
+    if (numCores == 0) numCores = 4; // Fallback
+
+    // Optimization based on the fact that inference is async and handled by the engine.
+    // The detection threads only perform preprocessing and submission, which is fast.
+    // One detection thread is sufficient to saturate the inference engine's queue.
+    // We allocate more threads to recognition to handle the results as they arrive.
+    numRecognitionThreads_ = numCores / 2;
+    numDetectionThreads_ = numCores - numRecognitionThreads_;
     
     LOG_INFO("OCRPipeline: Detected %u CPU cores", numCores);
     LOG_INFO("  Detection threads: %d", numDetectionThreads_);
@@ -147,7 +152,7 @@ bool OCRPipeline::initialize() {
     detector_ = std::make_unique<TextDetector>(config_.detectorConfig);
     
     // Set callback for async mode
-    detector_->setCallback([this](std::vector<DeepXOCR::TextBox> boxes, int64_t taskId, cv::Mat image, double pp, double inf, double post) {
+    detector_->setCallback([this](std::vector<DeepXOCR::TextBox> boxes, int64_t taskId, cv::Mat image, double /*pp*/, double /*inf*/, double /*post*/) {
         // Sort Boxes
         std::sort(boxes.begin(), boxes.end(), [](const DeepXOCR::TextBox& a, const DeepXOCR::TextBox& b) {
             if (std::abs(a.points[0].y - b.points[0].y) < 1.0f) {
@@ -500,43 +505,6 @@ bool OCRPipeline::processWithVisualization(const cv::Mat& image,
     }
     
     return true;
-}
-
-int OCRPipeline::processBatch(const std::vector<cv::Mat>& images,
-                             std::vector<std::vector<PipelineOCRResult>>& allResults,
-                             OCRPipelineStats* stats) {
-    if (!initialized_) {
-        LOG_ERROR("OCRPipeline not initialized");
-        return 0;
-    }
-    
-    allResults.clear();
-    allResults.resize(images.size());
-    
-    int successCount = 0;
-    OCRPipelineStats totalStats;
-    
-    for (size_t i = 0; i < images.size(); ++i) {
-        OCRPipelineStats singleStats;
-        if (process(images[i], allResults[i], &singleStats)) {
-            successCount++;
-            
-            // Accumulate statistics
-            totalStats.detectionTime += singleStats.detectionTime;
-            totalStats.recognitionTime += singleStats.recognitionTime;
-            totalStats.totalTime += singleStats.totalTime;
-            totalStats.detectedBoxes += singleStats.detectedBoxes;
-            totalStats.recognizedBoxes += singleStats.recognizedBoxes;
-        }
-    }
-    
-    if (stats && successCount > 0) {
-        *stats = totalStats;
-        stats->recognitionRate = totalStats.detectedBoxes == 0 ? 0.0 :
-            (static_cast<double>(totalStats.recognizedBoxes) / totalStats.detectedBoxes * 100.0);
-    }
-    
-    return successCount;
 }
 
 bool OCRPipeline::saveResultsToJSON(const std::vector<PipelineOCRResult>& results,

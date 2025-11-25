@@ -100,19 +100,21 @@ int main(int argc, char** argv) {
     // Start Async Pipeline
     pipeline.start();
 
+    const int NUM_REPEATS = 3;
+    int total_tasks = images.size() * NUM_REPEATS;
+
     auto start_time = std::chrono::high_resolution_clock::now();
     std::atomic<int> completed_count{0};
-    int total_images = images.size();
 
     // Consumer Thread
     std::thread consumer([&]() {
         std::vector<ocr::PipelineOCRResult> results;
         int64_t id;
-        while (completed_count.load() < total_images) {
+        while (completed_count.load() < total_tasks) {
             if (pipeline.getResult(results, id)) {
                 completed_count.fetch_add(1);
                 if (completed_count.load() % 10 == 0) {
-                    LOG_INFO("Processed %d/%d", completed_count.load(), total_images);
+                    LOG_INFO("Processed %d/%d", completed_count.load(), total_tasks);
                 }
             } else {
                 std::this_thread::yield();
@@ -121,10 +123,13 @@ int main(int argc, char** argv) {
     });
 
     // Producer Loop
-    for (int i = 0; i < total_images; ++i) {
-        while (!pipeline.pushTask(images[i], i)) {
-            // Queue full, wait a bit
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    for (int r = 0; r < NUM_REPEATS; ++r) {
+        for (size_t i = 0; i < images.size(); ++i) {
+            int64_t task_id = r * images.size() + i;
+            while (!pipeline.pushTask(images[i], task_id)) {
+                // Queue full, wait a bit
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         }
     }
 
@@ -134,12 +139,12 @@ int main(int argc, char** argv) {
     pipeline.stop();
 
     double total_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    double fps = total_images / (total_time_ms / 1000.0);
+    double fps = total_tasks / (total_time_ms / 1000.0);
 
     LOG_INFO("========== Async Performance ==========");
-    LOG_INFO("Total Images: %d", total_images);
+    LOG_INFO("Total Tasks: %d (Images: %zu, Repeats: %d)", total_tasks, images.size(), NUM_REPEATS);
     LOG_INFO("Total Time: %.2f ms", total_time_ms);
-    LOG_INFO("Average Time: %.2f ms/image", total_time_ms / total_images);
+    LOG_INFO("Average Time: %.2f ms/image", total_time_ms / total_tasks);
     LOG_INFO("FPS: %.2f", fps);
     LOG_INFO("=======================================");
 

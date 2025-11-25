@@ -152,16 +152,6 @@ public:
                                  cv::Mat& visualImage,
                                  OCRPipelineStats* stats = nullptr);
     
-    /**
-     * @brief 批量处理图片
-     * @param images 输入图片列表
-     * @param allResults 输出所有OCR结果
-     * @param stats 输出整体性能统计（可选）
-     * @return 成功处理的图片数量
-     */
-    int processBatch(const std::vector<cv::Mat>& images,
-                    std::vector<std::vector<PipelineOCRResult>>& allResults,
-                    OCRPipelineStats* stats = nullptr);
     
     /**
      * @brief 将结果保存为JSON
