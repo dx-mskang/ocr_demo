@@ -33,7 +33,7 @@ except ImportError:
 class OCRBenchmark:
     """DXNN OCR Benchmark Tool"""
     
-    def __init__(self, workers=1, runs_per_image=3, random_rotate=False, disable_doc_ori=False, mode='sync', use_mobile=False, async_batch_size=50, verbose=False):
+    def __init__(self, workers=1, runs_per_image=3, random_rotate=False, disable_doc_ori=False, mode='sync', use_mobile=False, async_batch_size=50, async_input_interval=0.0, verbose=False, output_dir=None):
         """
         Initialize benchmark tool
         
@@ -44,6 +44,7 @@ class OCRBenchmark:
             disable_doc_ori: Whether to disable document orientation correction
             mode: 'sync' or 'async' pipeline mode
             async_batch_size: Batch size for async mode processing (default: 50)
+            output_dir: Directory to save results (used for async profiling)
         """
         self.runs_per_image = runs_per_image
         self.random_rotate = random_rotate
@@ -52,6 +53,8 @@ class OCRBenchmark:
         self.async_batch_size = async_batch_size
         self.results = []
         self.verbose = verbose
+        self.output_dir = output_dir
+        self.async_input_interval = max(0.0, float(async_input_interval))
         
         print(f"[INIT] Initializing DXNN-OCR benchmark (Mode: {mode.upper()})")
         if random_rotate:
@@ -84,20 +87,12 @@ class OCRBenchmark:
             cls_model = IE(f'{model_dir}/textline_ori.dxnn')
             
             # Load recognition models
-            if not use_mobile:
-                rec_3 = IE(f'{model_dir}/rec_v5_ratio_3.dxnn')
-                rec_5 = IE(f'{model_dir}/rec_v5_ratio_5.dxnn')
-                rec_10 = IE(f'{model_dir}/rec_v5_ratio_10.dxnn')
-                rec_15 = IE(f'{model_dir}/rec_v5_ratio_15.dxnn')
-                rec_25 = IE(f'{model_dir}/rec_v5_ratio_25.dxnn')
-                rec_35 = IE(f'{model_dir}/rec_v5_ratio_35.dxnn')
-            else:
-                rec_3 = IE(f'{model_dir}/rec_mobile_ratio_3.dxnn')
-                rec_5 = IE(f'{model_dir}/rec_mobile_ratio_5.dxnn')
-                rec_10 = IE(f'{model_dir}/rec_mobile_ratio_10.dxnn')
-                rec_15 = IE(f'{model_dir}/rec_mobile_ratio_15.dxnn')
-                rec_25 = IE(f'{model_dir}/rec_mobile_ratio_25.dxnn')
-                rec_35 = IE(f'{model_dir}/rec_mobile_ratio_35.dxnn')
+            rec_3 = IE(f'{model_dir}/rec_v5_ratio_3.dxnn')
+            rec_5 = IE(f'{model_dir}/rec_v5_ratio_5.dxnn')
+            rec_10 = IE(f'{model_dir}/rec_v5_ratio_10.dxnn')
+            rec_15 = IE(f'{model_dir}/rec_v5_ratio_15.dxnn')
+            rec_25 = IE(f'{model_dir}/rec_v5_ratio_25.dxnn')
+            rec_35 = IE(f'{model_dir}/rec_v5_ratio_35.dxnn')
             
             rec_models = {
                 3: rec_3, 5: rec_5, 10: rec_10, 15: rec_15, 25: rec_25, 35: rec_35,
@@ -119,6 +114,7 @@ class OCRBenchmark:
                 doc_unwarping_model=doc_unwarp,
                 use_doc_preprocessing=True,
                 use_doc_orientation=use_doc_orientation,
+                input_interval=self.async_input_interval,
                 verbose=verbose
             )
             self.ocr_workers = [self.ocr_engine]  # For compatibility
@@ -302,7 +298,7 @@ class OCRBenchmark:
                 crops = []  # Crops not returned in async mode
             else:
                 # Sync mode: use __call__
-                boxes, crops, rec_results, processed_image, _ = self.ocr_engine(image)  # type: ignore
+                boxes, crops, rec_results, processed_image = self.ocr_engine(image)  # type: ignore
             
             end_time = time.time()
             
@@ -497,141 +493,189 @@ class OCRBenchmark:
             List of benchmark results for each image
         """
         print(f"\n[BATCH ASYNC] Starting parallel batch processing of {len(image_paths)} images...")
-        
+
+        # Preload all images to avoid I/O overhead during benchmarking
+        print(f"[BATCH ASYNC] Preloading {len(image_paths)} images...", flush=True)
+        all_images = []
+        all_valid_paths = []
+        for path in image_paths:
+            img = cv2.imread(path)
+            if img is not None:
+                all_images.append(img)
+                all_valid_paths.append(path)
+            else:
+                print(f"[ERROR] Failed to load image: {path}")
+
+        if not all_valid_paths:
+            print("[BATCH ASYNC] No valid images to process.")
+            return []
+
+        # Prepare per-image tracking structures
+        image_records = []
+        record_by_path = {}
+        for path, img in zip(all_valid_paths, all_images):
+            filename = os.path.basename(path)
+            ground_truth = ground_truths.get(filename) if ground_truths else None
+            record = {
+                'path': path,
+                'filename': filename,
+                'ground_truth': ground_truth,
+                'timings_ms': [],
+                'ocr_payload': None,
+                'original_image': img.copy() if img is not None else None
+            }
+            image_records.append(record)
+            record_by_path[path] = record
+
         batch_start_time = time.time()
         results = []
-        successful_count = 0
-        failed_count = 0
-        
+
         # Process in batches for optimal NPU utilization
         batch_size = self.async_batch_size
-        total_batches = (len(image_paths) + batch_size - 1) // batch_size
-        
-        print(f"[BATCH ASYNC] Using batch size: {batch_size}")
-        
-        for batch_idx in range(0, len(image_paths), batch_size):
-            batch_paths = image_paths[batch_idx:batch_idx + batch_size]
-            current_batch_num = batch_idx // batch_size + 1
-            
-            print(f"\n[BATCH {current_batch_num}/{total_batches}] Processing {len(batch_paths)} images in parallel...", flush=True)
-            
-            # Load all images in batch
-            batch_images = []
-            valid_paths = []
-            for path in batch_paths:
-                img = cv2.imread(path)
-                if img is not None:
-                    batch_images.append(img)
-                    valid_paths.append(path)
-                else:
-                    print(f"[ERROR] Failed to load image: {path}")
-            
-            if not batch_images:
-                continue
-            
-            # Run inference multiple times for averaging
-            batch_timings = []
-            batch_ocr_results = None
-            
-            for run_idx in range(self.runs_per_image):
-                run_start = time.time()
-                
-                # Process entire batch at once
-                from engine.paddleocr import AsyncPipelineOCR
-                if isinstance(self.ocr_engine, AsyncPipelineOCR):
-                    ocr_results = self.ocr_engine.process_batch(batch_images, timeout=60.0)
-                else:
-                    raise RuntimeError("Async mode requires AsyncPipelineOCR")
-                
-                run_end = time.time()
-                batch_timings.append((run_end - run_start) * 1000)
-                
-                # Store results from first run
-                if run_idx == 0:
-                    batch_ocr_results = ocr_results
-            
-            # Calculate average timing per image in batch
-            avg_batch_time = statistics.mean(batch_timings)
-            avg_time_per_image = avg_batch_time / len(batch_images)
-            
-            # Process each result (type assertion for batch_ocr_results)
-            if batch_ocr_results is None:
-                continue
-                
-            for img_idx, (path, ocr_result) in enumerate(zip(valid_paths, batch_ocr_results)):
-                filename = os.path.basename(path)
-                ground_truth = ground_truths.get(filename) if ground_truths else None
-                
-                # Extract OCR results
-                boxes = ocr_result.get('boxes', [])
-                rec_results = ocr_result.get('rec_results', [])
-                processed_image = ocr_result.get('processed_image')
-                if processed_image is None:
-                    processed_image = ocr_result.get('preprocessed_image')
-                
-                # Combine all text with same confidence filtering as sync mode (score > 0.3)
-                filtered_results = [r for r in rec_results if r.get('score', 0) > 0.3 and r.get('text')]
-                ocr_text = ' '.join([r['text'] for r in filtered_results])
-                total_chars = sum(len(r['text']) for r in filtered_results)
-                detection_texts = [r['text'] for r in filtered_results]
-                detection_scores = [r.get('score', 0.0) for r in filtered_results]
+        total_batches = (len(all_valid_paths) + batch_size - 1) // batch_size
+        total_iterations = max(1, int(self.runs_per_image))
 
-                original_image = None
-                if processed_image is not None:
-                    original_image = processed_image.copy()
-                elif img_idx < len(batch_images):
-                    original_image = batch_images[img_idx].copy()
-                
-                # Calculate accuracy if ground truth available
-                # Use same accuracy calculation as sync mode for fair comparison
-                accuracy_metrics = None
-                if ground_truth and calculate_research_standard_accuracy is not None:
-                    try:
-                        # Create mock structures for compatibility with calculate_research_standard_accuracy
-                        mock_gt = {'document': [{'text': ground_truth}]}
-                        mock_ocr = {'rec_texts': [ocr_text]}
-                        accuracy_metrics = calculate_research_standard_accuracy(mock_gt, mock_ocr, debug=False)
-                    except Exception as e:
-                        print(f"  [WARNING] Accuracy calculation failed for {filename}: {e}")
-                        accuracy_metrics = None
-                elif ground_truth and calculate_research_standard_accuracy is None:
-                    print(f"  [WARNING] Accuracy module not available, fallback to simple accuracy calculation")
-                    # Fallback to simple character accuracy if research module not available
-                    accuracy_metrics = self.calculate_character_accuracy(ground_truth, ocr_text)
-                else:
-                    print(f"  [INFO] No ground truth available for {filename}, skipping accuracy calculation")
-        
-                # Build result
-                result = {
-                    'filename': filename,
-                    'image_path': path,
-                    'success': True,
-                    'inference_time_ms': avg_time_per_image,
-                    'fps': 1000.0 / avg_time_per_image if avg_time_per_image > 0 else 0,
-                    'total_boxes': len(boxes),
-                    'total_characters': total_chars,
-                    'characters_per_second': (total_chars * 1000.0) / avg_time_per_image if avg_time_per_image > 0 else 0,
-                    'ocr_text': ocr_text,
-                    'ground_truth': ground_truth,
-                    'accuracy_metrics': accuracy_metrics,
-                    'boxes': boxes,
-                    'rec_results': rec_results,
-                    'processed_image': processed_image,
-                    'runs': self.runs_per_image,
-                    'timings_ms': batch_timings,
-                    'detection_boxes': boxes,
-                    'detection_texts': detection_texts,
-                    'detection_scores': detection_scores,
-                    'original_image': original_image
-                }
-                
-                results.append(result)
-                successful_count += 1
-                
-                print(f"  ✓ {filename}: {avg_time_per_image:.2f} ms, {len(boxes)} boxes, {total_chars} chars")
-        
+        print(f"[BATCH ASYNC] Using batch size: {batch_size}")
+        print(f"[BATCH ASYNC] Running {total_iterations} iteration(s) across full dataset")
+
+        from engine.paddleocr import AsyncPipelineOCR
+        if not isinstance(self.ocr_engine, AsyncPipelineOCR):
+            raise RuntimeError("Async mode requires AsyncPipelineOCR")
+
+        for iter_idx in range(total_iterations):
+            print(f"\n[ITER {iter_idx+1}/{total_iterations}] Starting async pass...", flush=True)
+            for batch_idx in range(0, len(all_valid_paths), batch_size):
+                batch_images = all_images[batch_idx:batch_idx + batch_size]
+                valid_paths = all_valid_paths[batch_idx:batch_idx + batch_size]
+                current_batch_num = batch_idx // batch_size + 1
+                print(f"[ITER {iter_idx+1}] Batch {current_batch_num}/{total_batches} ({len(batch_images)} images)", flush=True)
+
+                if not batch_images:
+                    continue
+
+                run_start = time.time()
+                ocr_results = self.ocr_engine.process_batch(batch_images, timeout=60.0, debug_output_dir=self.output_dir)
+                run_end = time.time()
+
+                batch_time_ms = (run_end - run_start) * 1000
+                avg_time_per_image = batch_time_ms / len(batch_images)
+
+                for path in valid_paths:
+                    record = record_by_path.get(path)
+                    if record is not None:
+                        record['timings_ms'].append(avg_time_per_image)
+
+                if iter_idx == 0:
+                    for path, ocr_result in zip(valid_paths, ocr_results):
+                        record = record_by_path.get(path)
+                        if not record or record['ocr_payload'] is not None:
+                            continue
+                        record['ocr_payload'] = {
+                            'boxes': ocr_result.get('boxes', []),
+                            'rec_results': ocr_result.get('rec_results', []),
+                            'processed_image': ocr_result.get('processed_image'),
+                            'preprocessed_image': ocr_result.get('preprocessed_image')
+                        }
+
         batch_end_time = time.time()
         batch_duration_ms = (batch_end_time - batch_start_time) * 1000
+
+        successful_count = 0
+        failed_load_count = len(image_paths) - len(all_valid_paths)
+        failed_inference_count = 0
+
+        for record in image_records:
+            payload = record.get('ocr_payload')
+            timings = record['timings_ms']
+            avg_time_per_image = statistics.mean(timings) if timings else 0.0
+
+            if payload is None:
+                failed_inference_count += 1
+                results.append({
+                    'filename': record['filename'],
+                    'image_path': record['path'],
+                    'success': False,
+                    'inference_time_ms': avg_time_per_image,
+                    'fps': 0.0,
+                    'total_boxes': 0,
+                    'total_characters': 0,
+                    'characters_per_second': 0.0,
+                    'ocr_text': '',
+                    'ground_truth': record['ground_truth'],
+                    'accuracy_metrics': None,
+                    'boxes': [],
+                    'rec_results': [],
+                    'processed_image': None,
+                    'runs': total_iterations,
+                    'timings_ms': timings,
+                    'detection_boxes': [],
+                    'detection_texts': [],
+                    'detection_scores': [],
+                    'original_image': record['original_image']
+                })
+                continue
+
+            boxes = payload.get('boxes', [])
+            rec_results = payload.get('rec_results', [])
+            processed_image = payload.get('processed_image')
+            if processed_image is None:
+                processed_image = payload.get('preprocessed_image')
+
+            filtered_results = [r for r in rec_results if r.get('score', 0) > 0.3 and r.get('text')]
+            ocr_text = ' '.join([r['text'] for r in filtered_results])
+            total_chars = sum(len(r['text']) for r in filtered_results)
+            detection_texts = [r['text'] for r in filtered_results]
+            detection_scores = [r.get('score', 0.0) for r in filtered_results]
+
+            original_image = None
+            if processed_image is not None:
+                original_image = processed_image.copy()
+            elif record['original_image'] is not None:
+                original_image = record['original_image'].copy()
+
+            accuracy_metrics = None
+            if record['ground_truth'] and calculate_research_standard_accuracy is not None:
+                try:
+                    mock_gt = {'document': [{'text': record['ground_truth']}]}
+                    mock_ocr = {'rec_texts': [ocr_text]}
+                    accuracy_metrics = calculate_research_standard_accuracy(mock_gt, mock_ocr, debug=False)
+                except Exception as e:
+                    print(f"  [WARNING] Accuracy calculation failed for {record['filename']}: {e}")
+                    accuracy_metrics = None
+            elif record['ground_truth'] and calculate_research_standard_accuracy is None:
+                print(f"  [WARNING] Accuracy module not available, fallback to simple accuracy calculation")
+                accuracy_metrics = self.calculate_character_accuracy(record['ground_truth'], ocr_text)
+            else:
+                print(f"  [INFO] No ground truth available for {record['filename']}, skipping accuracy calculation")
+
+            result = {
+                'filename': record['filename'],
+                'image_path': record['path'],
+                'success': True,
+                'inference_time_ms': avg_time_per_image,
+                'fps': 1000.0 / avg_time_per_image if avg_time_per_image > 0 else 0,
+                'total_boxes': len(boxes),
+                'total_characters': total_chars,
+                'characters_per_second': (total_chars * 1000.0) / avg_time_per_image if avg_time_per_image > 0 else 0,
+                'ocr_text': ocr_text,
+                'ground_truth': record['ground_truth'],
+                'accuracy_metrics': accuracy_metrics,
+                'boxes': boxes,
+                'rec_results': rec_results,
+                'processed_image': processed_image,
+                'runs': total_iterations,
+                'timings_ms': timings,
+                'detection_boxes': boxes,
+                'detection_texts': detection_texts,
+                'detection_scores': detection_scores,
+                'original_image': original_image
+            }
+
+            results.append(result)
+            successful_count += 1
+            print(f"  ✓ {record['filename']}: {avg_time_per_image:.2f} ms, {len(boxes)} boxes, {total_chars} chars")
+
+        failed_count = failed_load_count + failed_inference_count
         
         print(f"\n[BATCH ASYNC] Parallel batch processing completed in {batch_duration_ms:.2f} ms")
         print(f"[BATCH ASYNC] Success rate: {successful_count}/{len(image_paths)} ({100.0*successful_count/len(image_paths):.1f}%)")
@@ -1193,6 +1237,8 @@ Examples:
                        help='Pipeline mode: sync (sequential) or async (parallel callbacks). Default: sync')
     parser.add_argument('--async-batch-size', type=int, default=50,
                        help='Batch size for async mode processing (default: 50)')
+    parser.add_argument('--async-input-interval', type=float, default=0.0,
+                       help='Sleep interval (seconds) between async job submissions to DXRT callbacks')
     parser.add_argument('--recursive', action='store_true',
                        help='Process directory recursively')
     parser.add_argument('--runs', type=int, default=3,
@@ -1272,6 +1318,7 @@ Examples:
         mode=args.mode,
         use_mobile=args.use_mobile,
         async_batch_size=args.async_batch_size,
+        async_input_interval=args.async_input_interval,
         verbose=args.verbose
     )
     
@@ -1283,6 +1330,10 @@ Examples:
     benchmark.print_summary_report(summary)
     benchmark.print_pp_ocrv5_style_results(results, summary)
     benchmark.print_pp_ocrv5_style_summary(summary)
+    
+    # Print detailed profiling report for async mode
+    if args.mode == 'async' and hasattr(benchmark.ocr_engine, 'print_performance_report'):
+        benchmark.ocr_engine.print_performance_report()  # type: ignore[attr-defined]
     
     # Save results if output directory specified
     if args.output:

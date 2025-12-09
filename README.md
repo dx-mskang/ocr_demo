@@ -1,15 +1,14 @@
 # PP-OCRv5 DEEPX Baseline
 
-PP-OCRv5 DEEPX benchmarking toolchain with NPU acceleration and comprehensive performance evaluation.
+PP-OCRv5 DEEPX benchmarking toolchain with NPU acceleration and automated async pipeline.
 
 ## Key Features
 
 - **High Performance**: Async mode delivers **2.5x faster** inference with **3.2x higher** throughput
 - **NPU Acceleration**: DEEPX DX-M1 NPU optimization for maximum performance
-- **Dual Processing Modes**: 
-  - Sync mode for stable sequential processing
-  - Async mode for maximum parallel performance
-- **Comprehensive Benchmarking**: Detailed performance metrics and accuracy evaluation
+- **Automated Setup**: One-command pipeline with model auto-download and environment setup
+- **User-Controlled Benchmarking**: 10-second prompt to confirm benchmark execution
+- **Async Processing**: Optimized parallel processing pipeline for maximum performance
 - **Rich Visualization**: Automatic generation of OCR result visualizations
 
 ## Performance Results
@@ -37,21 +36,16 @@ This project uses a diverse custom Chinese dataset for benchmarking. The dataset
 
 ### Benchmark Results
 
-#### Sync Mode (Sequential Processing)
-| Processing Mode | Average Inference Time (ms) | Average FPS | Average CPS (chars/s) | Average Accuracy (%) | Total Processing Time (s) |
-|---|---|---|---|---|---|
-| `Sync (Sequential)` | 1325.72 | 1.03 | 284.84 | 93.49 | 27.67 |
-
 #### Async Mode (Parallel Processing)
 | Processing Mode | Average Inference Time (ms) | Average FPS | Average CPS (chars/s) | Average Accuracy (%) | Total Processing Time (s) |
 |---|---|---|---|---|---|
 | `Async (Parallel)` | 523.79 | 1.91 | 908.38 | 92.19 | 11.53 |
 
-**Performance Comparison**:
-- **Inference Speed**: Async mode is **2.5x faster** per image (523.79ms vs 1325.72ms)
-- **Throughput**: Async mode achieves **3.2x higher** characters per second (908.38 vs 284.84)
-- **Overall Processing**: Async mode completes **2.4x faster** for full batch (11.53s vs 27.67s)
-- **Accuracy**: Both modes maintain high accuracy (>92%)
+**Performance Highlights**:
+- **Optimized Pipeline**: Async-only processing for maximum throughput
+- **Inference Speed**: 523.79ms average per image
+- **High Throughput**: 908.38 characters per second processing rate
+- **Excellent Accuracy**: 92.19% recognition accuracy maintained
 
 ## System Requirements
 
@@ -90,82 +84,84 @@ cd dx_baidu_gui
 
 **What `startup.sh` Does Automatically:**
 
- **Phase 1: Environment Setup**
+✨ **Phase 1: Environment Setup**
 - Creates and activates Python virtual environment
 - Installs all required dependencies from `requirements.txt`
+- **Auto-downloads DXNN models** if missing (runs `setup.sh` automatically)
 - Verifies dataset and ground truth files
 
- **Phase 2: RT Optimization** 
-- Automatically applies `set_env.sh 1 3 1 18 1 4` for optimal NPU performance
+⚡ **Phase 2: RT Optimization** 
+- Automatically applies `set_env.sh 1 2 1 3 2 4` for optimal NPU performance
 - Configures DXRT environment variables for maximum throughput
 
-**Phase 3: Sync Benchmark**
-- Runs sequential processing benchmark
-- Saves results to `output_sync/` directory
-- Logs detailed performance metrics
-- Check output md file : [DXNN-OCR_benchmark_report.md](output_sync/DXNN-OCR_benchmark_report.md)
-
-**Phase 4: Async Benchmark**
-- Runs parallel processing benchmark (2.5x faster)
+🚀 **Phase 3: User-Controlled Benchmark**
+- **10-second prompt**: "Run benchmark now? [y/N] (auto-no in 10s)"
+- If user confirms 'y': Runs async benchmark pipeline
+- If timeout/no: Exits gracefully with environment ready
 - Saves results to `output_async/` directory
-- Captures async-specific performance data
-- Check output md file : [DXNN-OCR_benchmark_report.md](output_async/DXNN-OCR_benchmark_report.md)
+- Generates comprehensive performance report
 
-**Phase 5: Automatic Comparison**
-- Executes `scripts/compare_sync_async.py`
-- Generates side-by-side performance comparison
-- Displays speedup metrics and improvement summary
+**Final Output (if benchmark runs):**
+- High-performance async processing results
+- Detailed performance metrics and timing analysis
+- Comprehensive logs for troubleshooting in `logs/`
+- Ready-to-use benchmark reports in `output_async/`
 
-**Final Output:**
-- Complete performance comparison with speedup calculations
-- Separate result directories for easy analysis
-- Comprehensive logs for troubleshooting
-- Ready-to-use benchmark reports
+**Model Auto-Setup:**
+- Automatically checks for `engine/models/dxnn_optimized` and `dxnn_mobile_optimized`
+- Runs `setup.sh` automatically if models are missing
+- No manual model download required
 
 **RT Optimization (Recommended):**
 ```bash
 # Apply DXRT optimization settings for maximum performance
-source ./set_env.sh 1 3 1 18 1 4
+source ./set_env.sh 1 2 1 3 2 4
 
 # Explanation of parameters:
 # CUSTOM_INTER_OP_THREADS_COUNT=1     # Inter-operation parallelism
-# CUSTOM_INTRA_OP_THREADS_COUNT=3     # Intra-operation parallelism  
+# CUSTOM_INTRA_OP_THREADS_COUNT=2     # Intra-operation parallelism  
 # DXRT_DYNAMIC_CPU_THREAD=1           # Dynamic CPU thread management
-# DXRT_TASK_MAX_LOAD=18               # Maximum task load
-# NFH_INPUT_WORKER_THREADS=1          # Input worker threads
+# DXRT_TASK_MAX_LOAD=3                # Maximum task load
+# NFH_INPUT_WORKER_THREADS=2          # Input worker threads
 # NFH_OUTPUT_WORKER_THREADS=4         # Output worker threads
 ```
 
 **Advanced Usage Examples:**
 ```bash
 # Step 1: Apply RT optimization (recommended for best performance)
-source ./set_env.sh 1 3 1 18 1 4
+source ./set_env.sh 1 2 1 3 2 4
 
-# Step 2: Run benchmark
-# Sync mode (sequential processing)
+# Step 2: Run async benchmark (optimized parallel processing)
 python scripts/dxnn_benchmark.py \
-    -d sampled_dataset/ \
-    --mode sync \
+    -d images/ \
+    --mode async \
     --output results/ \
-    --ground-truth sampled_dataset/labels.json \
+    --ground-truth images/labels.json \
     --runs 1
 
-# Async mode (parallel processing - 2.5x faster)
+# Alternative: Use mobile model variant
 python scripts/dxnn_benchmark.py \
-    -d sampled_dataset/ \
+    -d images/ \
     --mode async \
-    --output async_results/ \
-    --ground-truth sampled_dataset/labels.json \
+    --use-mobile \
+    --output results_mobile/ \
+    --ground-truth images/labels.json \
     --runs 1
 ```
 
 **Interactive GUI Demo:**
 ```bash
-# Launch interactive GUI demo (sync mode)
-python demo.py --version v5 --mode sync
-
-# Launch interactive GUI demo (async mode - 2.5x faster)
+# Launch interactive GUI demo (async mode with standard model)
 python demo.py --version v5 --mode async
+
+# Launch interactive GUI demo (async mode with mobile model)
+python demo.py --version v5 --mode async --use-mobile
+
+# Quick demo launcher with auto-setup and mobile model selection
+./run_v5_demo.sh
+# - Auto-creates environment if missing
+# - 10-second prompt: "Use mobile model? [y/N]"
+# - Launches async demo with selected model
 ```
 
 **GUI Features:**
@@ -173,28 +169,32 @@ python demo.py --version v5 --mode async
 - **Real-time Performance Metrics**: Live FPS and processing statistics
 - **Accuracy Comparison**: Side-by-side GPU vs NPU accuracy analysis
 - **Result Visualization**: Interactive preview of OCR detection and recognition results
-- **Dual Processing Modes**: Switch between sync and async processing modes
+- **Async Processing**: Optimized parallel processing for maximum performance
 
 ## 📁 Project Structure
 
 ```
 ├── demo.py                 # Interactive GUI demo with real-time OCR processing
-├── startup.sh              # Fully automated benchmark pipeline
+├── startup.sh              # Fully automated async benchmark pipeline
 │                           # - Environment setup & dependency installation
+│                           # - Auto DXNN model download (setup.sh)
 │                           # - RT optimization (set_env.sh) application
-│                           # - Sync benchmark execution → output_sync/
+│                           # - User confirmation (10s prompt)
 │                           # - Async benchmark execution → output_async/
-│                           # - Automatic performance comparison
+├── run_v5_demo.sh          # Quick demo launcher with mobile model option
 ├── set_env.sh              # DXRT optimization settings
+├── setup.sh                # DXNN model download script (auto-called)
 ├── scripts/
-│   ├── dxnn_benchmark.py   # Refactored benchmark tool with dual-mode support
-│   │                       # - Sync mode: Sequential processing (stable)
+│   ├── dxnn_benchmark.py   # Async-optimized benchmark tool
 │   │                       # - Async mode: Parallel processing (2.5x faster)
-│   ├── compare_sync_async.py # Performance comparison tool
+│   │                       # - Mobile model support (--use-mobile)
 │   ├── calculate_acc.py    # PP-OCRv5 compatible accuracy calculation
 │   └── ocr_engine.py       # DXNN NPU engine interface
 ├── engine/
-│   ├── model_files/v5/     # DXNN v5 NPU models (.dxnn format)
+│   ├── models/             # DXNN NPU models (auto-downloaded)
+│   │   ├── dxnn_optimized/       # Standard DXNN models
+│   │   └── dxnn_mobile_optimized/ # Mobile-optimized models
+│   ├── paddleocr.py       # Core OCR pipeline with async support
 │   ├── draw_utils.py       # Visualization utilities
 │   ├── utils.py           # Processing utilities
 │   └── fonts/             # Chinese fonts (for visualization)
@@ -206,26 +206,27 @@ python demo.py --version v5 --mode async
 **Custom Dataset:**
 ```bash
 # Step 1: Apply RT optimization for best performance
-source ./set_env.sh 1 3 1 18 1 4
+source ./set_env.sh 1 2 1 3 2 4
 
 # Step 2: Prepare your own images
 mkdir -p images/custom
 cp /path/to/your/images/* images/custom/
 
-# Step 3: Run benchmark with sync mode (stable)
-python scripts/dxnn_benchmark.py \
-    --directory images/custom \
-    --mode sync \
-    --ground-truth custom_labels.json \
-    --output output_custom \
-    --runs 3
-
-# Or run benchmark with async mode (2.5x faster)
+# Step 3: Run async benchmark (optimized parallel processing)
 python scripts/dxnn_benchmark.py \
     --directory images/custom \
     --mode async \
     --ground-truth custom_labels.json \
-    --output output_custom_async \
+    --output output_custom \
+    --runs 3
+
+# Optional: Run with mobile model for different performance profile
+python scripts/dxnn_benchmark.py \
+    --directory images/custom \
+    --mode async \
+    --use-mobile \
+    --ground-truth custom_labels.json \
+    --output output_custom_mobile \
     --runs 3
 ```
 
@@ -242,14 +243,14 @@ This project is forked and developed based on [DEEPX-AI/DXNN-OCR](https://github
 
 ## 🏆 Recent Improvements
 
-### Automated Benchmark Pipeline (Nov 2025)
-- **🚀 One-Command Execution**: Complete automated pipeline with `./startup.sh`
+### Automated Async Pipeline (Dec 2025)
+- **🚀 One-Command Execution**: Complete automated async pipeline with `./startup.sh`
   - Automatic environment setup and dependency installation
+  - Auto DXNN model download (setup.sh)
   - RT optimization application (`set_env.sh`) for maximum NPU performance
-  - Sequential sync benchmark execution with detailed logging
-  - Parallel async benchmark execution (2.5x performance boost)
-  - Automatic performance comparison and speedup calculation
-- **📊 Comprehensive Results**: Separate output directories (`output_sync/`, `output_async/`) with complete metrics
+  - User-controlled async benchmark execution (2.5x performance boost)
+  - Comprehensive performance reporting
+- **📊 Async-Only Results**: Optimized output directory (`output_async/`) with complete metrics
 - **🔧 Zero Configuration**: No manual intervention required - everything automated from start to finish
 
 ### Code Refactoring & Performance Optimization (Nov 2025)

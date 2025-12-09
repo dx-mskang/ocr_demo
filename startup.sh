@@ -164,7 +164,7 @@ if [[ -n "$DX_RT_PATH" ]]; then
     # Build dx_rt
     log "Building DX_RT with ./build.sh --clean..."
     cd "$DX_RT_PATH"
-    ./build.sh 2>&1 | tee -a "$LOG_DIR/dx_rt_build_${TIMESTAMP}.log"
+    ./build.sh --clean 2>&1 | tee -a "$LOG_DIR/dx_rt_build_${TIMESTAMP}.log"
     BUILD_EXIT_CODE=${PIPESTATUS[0]}
     cd "$PROJECT_ROOT"
     
@@ -327,7 +327,7 @@ log "=== Applying DXRT Optimization Settings ==="
 # Apply optimal RT settings for NPU performance
 if [[ -f "$PROJECT_ROOT/set_env.sh" ]]; then
     log "Applying DXRT optimization settings..."
-    source "$PROJECT_ROOT/set_env.sh" 1 2 1 3 2 4
+    source "$PROJECT_ROOT/set_env.sh" 1 2 1 2 2 4
     log "✓ RT optimization applied (CUSTOM_INTER_OP_THREADS_COUNT=1, CUSTOM_INTRA_OP_THREADS_COUNT=3, etc.)"
 else
     log "⚠ Warning: set_env.sh not found, skipping RT optimization"
@@ -353,10 +353,9 @@ fi
 
 log "=== Starting Automated DXNN-OCR Benchmark Pipeline ==="
 
-# Create separate output directories for sync and async results
-SYNC_OUTPUT="$PROJECT_ROOT/output_sync"
+# Create output directory for async results
 ASYNC_OUTPUT="$PROJECT_ROOT/output_async"
-mkdir -p "$SYNC_OUTPUT" "$ASYNC_OUTPUT"
+mkdir -p "$ASYNC_OUTPUT"
 
 # Function to run sync benchmark
 run_sync_benchmark() {
@@ -411,26 +410,19 @@ compare_results() {
     fi
 }
 
-# Execute complete benchmark pipeline
-log "Starting automated benchmark pipeline..."
+# Execute async-only benchmark pipeline
+log "Starting async benchmark pipeline..."
 
-# Phase 1: Sync benchmark
-if ! run_sync_benchmark; then
-    log "ERROR: Sync benchmark failed, aborting pipeline"
-    exit 1
-fi
+# Legacy sync benchmark function exists above but is no longer used
 
-# Phase 2: Async benchmark  
+# Phase 1: Async benchmark  
 if ! run_async_benchmark; then
     log "ERROR: Async benchmark failed, aborting pipeline"
     exit 1
 fi
 
-# Phase 3: Compare results
-if ! compare_results; then
-    log "ERROR: Results comparison failed"
-    exit 1
-fi
+# Note: Sync vs Async comparison removed since we only run async now
+log "✓ Async benchmark completed successfully"
 
 # =============================================================================
 # Cleanup and Summary
@@ -440,33 +432,26 @@ log "=== Automated Benchmark Pipeline Completion Summary ==="
 log "✓ Environment: $VIRTUAL_ENV"
 log "✓ Dataset: C++ baseline format (labels.json)"
 log "✓ RT Optimization: Applied via set_env.sh"
-log "✓ Sync Results: output_sync/"
 log "✓ Async Results: output_async/"
-log "✓ Performance Comparison: Completed"
 log "✓ Logs: $LOG_DIR/"
 
 # Display final performance summary
-if [[ -f "output_sync/benchmark_summary.json" && -f "output_async/benchmark_summary.json" ]]; then
+if [[ -f "output_async/benchmark_summary.json" ]]; then
     log "=== Final Performance Summary ==="
     python -c "
 import json
 
 try:
-    with open('output_sync/benchmark_summary.json', 'r') as f:
-        sync_results = json.load(f)
     with open('output_async/benchmark_summary.json', 'r') as f:
         async_results = json.load(f)
     
-    sync_time = sync_results.get('performance', {}).get('avg_inference_time_ms', 0)
     async_time = async_results.get('performance', {}).get('avg_inference_time_ms', 0)
     
-    if sync_time > 0 and async_time > 0:
-        speedup = sync_time / async_time
-        print(f'✅ SYNC mode: {sync_time:.2f} ms average inference time')
+    if async_time > 0:
         print(f'✅ ASYNC mode: {async_time:.2f} ms average inference time')
-        print(f'🚀 Performance improvement: {speedup:.2f}x speedup with async mode')
+        print(f'🚀 Async benchmark completed successfully')
     else:
-        print('⚠ Could not calculate performance comparison')
+        print('⚠ Could not read performance data')
         
 except Exception as e:
     print(f'Could not display performance summary: {e}')
@@ -479,14 +464,13 @@ log "Total execution log: $LOG_DIR/dxnn_benchmark_${TIMESTAMP}.log"
 
 echo ""
 echo "=========================================================="
-echo "DXNN-OCR Automated Benchmark Pipeline Complete! 🎉"
+echo "DXNN-OCR Async Benchmark Pipeline Complete! 🎉"
 echo "=========================================================="
 echo ""
 echo "Environment: $VIRTUAL_ENV"
-echo "Sync results: output_sync/"
 echo "Async results: output_async/"
 echo "Log files: $LOG_DIR/"
 echo ""
-echo "Performance comparison has been automatically generated."
+echo "Async benchmark has been completed."
 echo "Check the logs above for detailed performance metrics."
 echo ""

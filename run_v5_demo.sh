@@ -28,4 +28,4 @@ if [[ "$USE_MOBILE" =~ ^[Yy]$ ]]; then
 	EXTRA_ARGS="--use-mobile"
 fi
 
-python demo.py --version v5 --mode async $EXTRA_ARGS
+python demo.py --version v5 $EXTRA_ARGS

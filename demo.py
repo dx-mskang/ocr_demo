@@ -652,7 +652,7 @@ class AccuracyInfoWidget(QWidget):
 
 
 class ImageViewerApp(QWidget):
-    def __init__(self, ocr_workers=None, app_version=None, app_mode="sync", hide_preview=False):
+    def __init__(self, ocr_workers=None, app_version=None, hide_preview=False):
         super().__init__()
         self.setWindowTitle(f"PySide Image Viewer {app_version}")
         
@@ -665,7 +665,7 @@ class ImageViewerApp(QWidget):
         self.ocr_workers = ocr_workers
         self.current_worker_index = 0  # Index for round-robin worker selection
         self.app_version = app_version
-        self.app_mode = app_mode
+        self.app_mode = "async"
         
         # Camera related attributes
         self.camera_thread = None
@@ -1274,7 +1274,6 @@ class ImageViewerApp(QWidget):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--version', default='v4', choices=['v4', 'v5'])
-    parser.add_argument('--mode', default='sync', choices=['sync', 'async'])
     parser.add_argument('--use-mobile', dest='use_mobile', action='store_true', default=False)
     parser.add_argument('--hide-preview', dest='hide_preview', action='store_true', default=False)
     parser.add_argument('--enable-uvdoc', dest='disable_uvdoc', action='store_false', default=True)
@@ -1325,18 +1324,15 @@ if __name__ == "__main__":
     
     ocr_workers = []
     
-    if args.mode == "async":
-        for ratio in [3, 5, 10, 15, 25, 35]:
-            rec_models[f'ratio_{ratio}'] = rec_models[ratio]
-        ocr_workers = [AsyncPipelineOCR(
-            det_models=det_models, cls_model=cls_model, rec_models=rec_models, rec_dict_dir=rec_dict_dir,
-            doc_ori_model=doc_ori_model, doc_unwarping_model=doc_unwarping_model, 
-            use_doc_orientation=not args.disable_uvdoc, use_doc_preprocessing=not args.disable_uvdoc
-        )]
-    else:
-        ocr_workers = [PaddleOcr(det_models, cls_model, rec_models, rec_dict_dir, doc_ori_model, doc_unwarping_model) for _ in range(1)]
+    for ratio in [3, 5, 10, 15, 25, 35]:
+        rec_models[f'ratio_{ratio}'] = rec_models[ratio]
+    ocr_workers = [AsyncPipelineOCR(
+        det_models=det_models, cls_model=cls_model, rec_models=rec_models, rec_dict_dir=rec_dict_dir,
+        doc_ori_model=doc_ori_model, doc_unwarping_model=doc_unwarping_model, 
+        use_doc_orientation=not args.disable_uvdoc, use_doc_preprocessing=not args.disable_uvdoc, verbose=False
+    )]
     
     app = QApplication(sys.argv)
-    viewer = ImageViewerApp(ocr_workers=ocr_workers, app_version=args.version, app_mode=args.mode, hide_preview=args.hide_preview)
+    viewer = ImageViewerApp(ocr_workers=ocr_workers, app_version=args.version, hide_preview=args.hide_preview)
     viewer.show()
     sys.exit(app.exec())
