@@ -16,13 +16,13 @@ bool TextClassifier::Initialize() {
         return false;
     }
     
-    LOG_INFO("Loading classification model: %s", config_.modelPath.c_str());
+    LOG_INFO("Loading classification model: {}", config_.modelPath);
     
     try {
         engine_ = std::make_unique<dxrt::InferenceEngine>(config_.modelPath);
         LOG_INFO("Classification model loaded successfully");
     } catch (const std::exception& e) {
-        LOG_ERROR("Failed to load classification model: %s", e.what());
+        LOG_ERROR("Failed to load classification model: {}", e.what());
         return false;
     }
     
@@ -69,8 +69,8 @@ std::pair<std::string, float> TextClassifier::Classify(const cv::Mat& textImage)
     last_inference_time_ += std::chrono::duration<double, std::milli>(t3 - t2).count();
     last_postprocess_time_ += std::chrono::duration<double, std::milli>(t4 - t3).count();
     
-    LOG_DEBUG("Classification result: label=%s, confidence=%.3f", 
-              result.first.c_str(), result.second);
+    LOG_DEBUG("Classification result: label={}, confidence={:.3f}", 
+              result.first, result.second);
     
     return result;
 }
@@ -136,14 +136,14 @@ std::pair<std::string, float> TextClassifier::Postprocess(dxrt::TensorPtrs& outp
     // Get output shape
     auto shape = output->shape();
     if (shape.size() < 2) {
-        LOG_ERROR("Invalid output shape dimension: %zu", shape.size());
+        LOG_ERROR("Invalid output shape dimension: {}", shape.size());
         return {"0", 0.0f};
     }
     
     // Expected shape: [1, 2] or [2]
     size_t num_classes = shape[shape.size() - 1];
     if (num_classes != 2) {
-        LOG_ERROR("Invalid number of classes: %zu (expected 2)", num_classes);
+        LOG_ERROR("Invalid number of classes: {} (expected 2)", num_classes);
         return {"0", 0.0f};
     }
     
@@ -155,7 +155,7 @@ std::pair<std::string, float> TextClassifier::Postprocess(dxrt::TensorPtrs& outp
     }
     
     // Debug: Print raw outputs
-    LOG_DEBUG("Raw outputs: [%.6f, %.6f]", data[0], data[1]);
+    LOG_DEBUG("Raw outputs: [{:.6f}, {:.6f}]", data[0], data[1]);
     
     // Find argmax
     int max_idx = 0;
@@ -173,8 +173,8 @@ std::pair<std::string, float> TextClassifier::Postprocess(dxrt::TensorPtrs& outp
     float confidence = data[max_idx];
     std::string label = labels_[max_idx];
     
-    LOG_DEBUG("Result: max_idx=%d, label='%s', confidence=%.6f", 
-             max_idx, label.c_str(), confidence);
+    LOG_DEBUG("Result: max_idx={}, label='{}', confidence={:.6f}", 
+             max_idx, label, confidence);
     
     return {label, confidence};
 }

@@ -41,6 +41,40 @@ public:
         return value;
     }
 
+    // Non-blocking pop with timeout (returns false if timeout)
+    bool try_pop(T& value, std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
+        std::unique_lock<std::mutex> lock(_mtx);
+        if (!_cv_pop.wait_for(lock, timeout, [this]() { return !_q.empty(); })) {
+            return false;  // Timeout
+        }
+        value = std::move(_q.front());
+        _q.pop();
+        _cv_push.notify_one();
+        return true;
+    }
+
+    // Non-blocking push with timeout (returns false if timeout/queue full)
+    bool try_push(const T& value, std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
+        std::unique_lock<std::mutex> lock(_mtx);
+        if (!_cv_push.wait_for(lock, timeout, [this]() { return _q.size() < _max_size; })) {
+            return false;  // Timeout - queue is full
+        }
+        _q.push(value);
+        _cv_pop.notify_one();
+        return true;
+    }
+
+    // Non-blocking push with move semantics
+    bool try_push(T&& value, std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
+        std::unique_lock<std::mutex> lock(_mtx);
+        if (!_cv_push.wait_for(lock, timeout, [this]() { return _q.size() < _max_size; })) {
+            return false;  // Timeout - queue is full
+        }
+        _q.push(std::move(value));
+        _cv_pop.notify_one();
+        return true;
+    }
+
     // check if the queue is empty
     bool empty() const {
         std::unique_lock<std::mutex> lock(_mtx);

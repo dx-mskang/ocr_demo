@@ -22,9 +22,9 @@ bool TextRecognizer::Initialize() {
         try {
             auto model = std::make_unique<dxrt::InferenceEngine>(model_path);
             models_[ratio] = std::move(model);
-            LOG_INFO("  Loaded ratio_%d model: %s", ratio, model_path.c_str());
+            LOG_INFO("  Loaded ratio_{} model: {}", ratio, model_path);
         } catch (const std::exception& e) {
-            LOG_ERROR("Failed to load ratio_%d model: %s", ratio, e.what());
+            LOG_ERROR("Failed to load ratio_{} model: {}", ratio, e.what());
             return false;
         }
     }
@@ -35,7 +35,7 @@ bool TextRecognizer::Initialize() {
     }
     
     // 加载字符字典
-    LOG_INFO("Loading character dictionary from: %s", config_.dictPath.c_str());
+    LOG_INFO("Loading character dictionary from: {}", config_.dictPath);
     decoder_ = std::make_unique<ocr::CTCDecoder>(config_.dictPath, true);
     
     if (decoder_->getDictSize() == 0) {
@@ -44,8 +44,8 @@ bool TextRecognizer::Initialize() {
     }
     
     LOG_INFO("TextRecognizer initialized successfully");
-    LOG_INFO("  Models: %zu ratios", models_.size());
-    LOG_INFO("  Dictionary: %zu characters", decoder_->getDictSize());
+    LOG_INFO("  Models: {} ratios", models_.size());
+    LOG_INFO("  Dictionary: {} characters", decoder_->getDictSize());
     
     return true;
 }
@@ -59,7 +59,7 @@ std::pair<std::string, float> TextRecognizer::Recognize(const cv::Mat& textImage
     // 选择合适的模型
     auto* engine = SelectModel(textImage);
     if (!engine) {
-        LOG_ERROR("No suitable model for image size %dx%d", 
+        LOG_ERROR("No suitable model for image size {}x{}", 
                   textImage.cols, textImage.rows);
         return {"", 0.0f};
     }
@@ -67,7 +67,7 @@ std::pair<std::string, float> TextRecognizer::Recognize(const cv::Mat& textImage
     // 获取ratio
     int ratio = CalculateRatio(textImage.cols, textImage.rows);
     
-    LOG_DEBUG("Recognize: input size=%dx%d, calculated ratio=%d, using model=ratio_%d",
+    LOG_DEBUG("Recognize: input size={}x{}, calculated ratio={}, using model=ratio_{}",
               textImage.cols, textImage.rows, 
               textImage.cols / (textImage.rows > 0 ? textImage.rows : 1), ratio);
     
@@ -80,7 +80,7 @@ std::pair<std::string, float> TextRecognizer::Recognize(const cv::Mat& textImage
         return {"", 0.0f};
     }
     
-    LOG_DEBUG("Preprocessed: size=%dx%d, type=%d, depth=%d, channels=%d, elemSize=%zu",
+    LOG_DEBUG("Preprocessed: size={}x{}, type={}, depth={}, channels={}, elemSize={}",
               preprocessed.cols, preprocessed.rows, preprocessed.type(), 
               preprocessed.depth(), preprocessed.channels(), preprocessed.elemSize());
     
@@ -109,8 +109,8 @@ std::pair<std::string, float> TextRecognizer::Recognize(const cv::Mat& textImage
     
     // 置信度过滤
     if (result.second < config_.confThreshold) {
-        LOG_DEBUG("Low confidence FILTERED: text='%s', conf=%.4f < threshold=%.4f", 
-                  result.first.c_str(), result.second, config_.confThreshold);
+        LOG_DEBUG("Low confidence FILTERED: text='{}', conf={:.4f} < threshold={:.4f}", 
+                  result.first, result.second, config_.confThreshold);
         return {"", result.second};
     }
     
@@ -142,7 +142,7 @@ dxrt::InferenceEngine* TextRecognizer::SelectModel(const cv::Mat& image) {
     }
     
     // 如果找不到精确匹配，使用最接近的ratio
-    LOG_WARN("No exact model for ratio %d, using closest match", ratio);
+    LOG_WARN("No exact model for ratio {}, using closest match", ratio);
     
     int closest_ratio = -1;
     int min_diff = INT_MAX;
@@ -156,7 +156,7 @@ dxrt::InferenceEngine* TextRecognizer::SelectModel(const cv::Mat& image) {
     }
     
     if (closest_ratio != -1) {
-        LOG_DEBUG("Using ratio_%d model instead", closest_ratio);
+        LOG_DEBUG("Using ratio_{} model instead", closest_ratio);
         model_usage_[closest_ratio]++;
         return models_[closest_ratio].get();
     }
@@ -197,7 +197,7 @@ cv::Mat TextRecognizer::Preprocess(const cv::Mat& image, int ratio) {
         target_width = target_height * ratio;
     }
     
-    LOG_DEBUG("Preprocessing: %dx%d -> %dx%d (ratio_%d)",
+    LOG_DEBUG("Preprocessing: {}x{} -> {}x{} (ratio_{})",
               image.cols, image.rows, target_width, target_height, ratio);
     
     // 使用PPOCR预处理方式（与Detection一致）
@@ -240,7 +240,7 @@ cv::Mat TextRecognizer::Preprocess(const cv::Mat& image, int ratio) {
         resized = resized.clone();
     }
     
-    LOG_DEBUG("Preprocessed: input %dx%d -> padded %dx%d -> resized %dx%d HWC uint8",
+    LOG_DEBUG("Preprocessed: input {}x{} -> padded {}x{} -> resized {}x{} HWC uint8",
               image.cols, image.rows, padded.cols, padded.rows, target_width, target_height);
     
     return resized;
@@ -270,9 +270,9 @@ void TextRecognizer::PrintModelUsageStats() const {
     
     LOG_DEBUG_EXEC(([&]{
         for (const auto& [ratio, count] : model_usage_) {
-            LOG_DEBUG("  ratio_%d: %d times (%.1f%%)", ratio, count, (count * 100.0f) / total);
+            LOG_DEBUG("  ratio_{}: {} times ({:.1f}%)", ratio, count, (count * 100.0f) / total);
         }
-        LOG_DEBUG("  Total: %d recognitions", total);
+        LOG_DEBUG("  Total: {} recognitions", total);
     }));
 }
 

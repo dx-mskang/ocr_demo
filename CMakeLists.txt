@@ -63,6 +63,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_BACKUP}")
 # Global include directories
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CMAKE_SOURCE_DIR}/3rd-party/json/include)
+include_directories(${CMAKE_SOURCE_DIR}/3rd-party/spdlog/include)
 
 # Use SYSTEM to suppress warnings from 3rd-party libraries
 include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/3rd-party/clipper2/CPP/Clipper2Lib/include)

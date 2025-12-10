@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 std::vector<std::string> getImageFiles(const std::string& dirPath) {
     std::vector<std::string> imageFiles;
     if (!fs::exists(dirPath) || !fs::is_directory(dirPath)) {
-        LOG_ERROR("Directory does not exist: %s", dirPath.c_str());
+        LOG_ERROR("Directory does not exist: {}", dirPath);
         return imageFiles;
     }
     for (const auto& entry : fs::directory_iterator(dirPath)) {
@@ -39,26 +39,26 @@ int main(int argc, char** argv) {
     if (argc >= 3) modelDir = argv[2];
 
     ocr::OCRPipelineConfig config;
-    config.detectorConfig.model640Path = modelDir + "/best/det_v5_640.dxnn";
-    config.detectorConfig.model960Path = modelDir + "/best/det_v5_960.dxnn";
+    config.detectorConfig.model640Path = modelDir + "/server/det_v5_640.dxnn";
+    config.detectorConfig.model960Path = modelDir + "/server/det_v5_960.dxnn";
     config.detectorConfig.thresh = 0.3f;
     config.detectorConfig.boxThresh = 0.6f;
     config.detectorConfig.maxCandidates = 1500;
     config.detectorConfig.unclipRatio = 1.5f;
     
     config.recognizerConfig.modelPaths = {
-        {3, modelDir + "/best/rec_v5_ratio_3.dxnn"},
-        {5, modelDir + "/best/rec_v5_ratio_5.dxnn"},
-        {10, modelDir + "/best/rec_v5_ratio_10.dxnn"},
-        {15, modelDir + "/best/rec_v5_ratio_15.dxnn"},
-        {25, modelDir + "/best/rec_v5_ratio_25.dxnn"},
-        {35, modelDir + "/best/rec_v5_ratio_35.dxnn"}
+        {3, modelDir + "/server/rec_v5_ratio_3.dxnn"},
+        {5, modelDir + "/server/rec_v5_ratio_5.dxnn"},
+        {10, modelDir + "/server/rec_v5_ratio_10.dxnn"},
+        {15, modelDir + "/server/rec_v5_ratio_15.dxnn"},
+        {25, modelDir + "/server/rec_v5_ratio_25.dxnn"},
+        {35, modelDir + "/server/rec_v5_ratio_35.dxnn"}
     };
     config.recognizerConfig.dictPath = modelDir + "/ppocrv5_dict.txt";
     config.recognizerConfig.confThreshold = 0.3f;
     config.recognizerConfig.inputHeight = 48;
     
-    config.classifierConfig.modelPath = modelDir + "/best/textline_ori.dxnn";
+    config.classifierConfig.modelPath = modelDir + "/server/textline_ori.dxnn";
     config.classifierConfig.threshold = 0.9;
     config.classifierConfig.inputWidth = 160;
     config.classifierConfig.inputHeight = 80;
@@ -66,9 +66,9 @@ int main(int argc, char** argv) {
     
     config.useDocPreprocessing = true;
     config.docPreprocessingConfig.useOrientation = true;
-    config.docPreprocessingConfig.orientationConfig.modelPath = modelDir + "/best/doc_ori_fixed.dxnn";
+    config.docPreprocessingConfig.orientationConfig.modelPath = modelDir + "/server/doc_ori_fixed.dxnn";
     config.docPreprocessingConfig.useUnwarping = true;
-    config.docPreprocessingConfig.uvdocConfig.modelPath = modelDir + "/best/UVDoc_pruned_p3.dxnn";
+    config.docPreprocessingConfig.uvdocConfig.modelPath = modelDir + "/server/UVDoc_pruned_p3.dxnn";
     config.docPreprocessingConfig.uvdocConfig.inputWidth = 488;
     config.docPreprocessingConfig.uvdocConfig.inputHeight = 712;
     config.docPreprocessingConfig.uvdocConfig.alignCorners = true;
@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
         cv::Mat img = cv::imread(path);
         if (!img.empty()) images.push_back(img);
     }
-    LOG_INFO("Loaded %zu images", images.size());
+    LOG_INFO("Loaded {} images", images.size());
 
     // Start Async Pipeline
     pipeline.start();
@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
             if (pipeline.getResult(results, id)) {
                 completed_count.fetch_add(1);
                 if (completed_count.load() % 10 == 0) {
-                    LOG_INFO("Processed %d/%d", completed_count.load(), total_tasks);
+                    LOG_INFO("Processed {}/{}", completed_count.load(), total_tasks);
                 }
             } else {
                 std::this_thread::yield();
@@ -142,10 +142,10 @@ int main(int argc, char** argv) {
     double fps = total_tasks / (total_time_ms / 1000.0);
 
     LOG_INFO("========== Async Performance ==========");
-    LOG_INFO("Total Tasks: %d (Images: %zu, Repeats: %d)", total_tasks, images.size(), NUM_REPEATS);
-    LOG_INFO("Total Time: %.2f ms", total_time_ms);
-    LOG_INFO("Average Time: %.2f ms/image", total_time_ms / total_tasks);
-    LOG_INFO("FPS: %.2f", fps);
+    LOG_INFO("Total Tasks: {} (Images: {}, Repeats: {})", total_tasks, images.size(), NUM_REPEATS);
+    LOG_INFO("Total Time: {:.2f} ms", total_time_ms);
+    LOG_INFO("Average Time: {:.2f} ms/image", total_time_ms / total_tasks);
+    LOG_INFO("FPS: {:.2f}", fps);
     LOG_INFO("=======================================");
 
     return 0;

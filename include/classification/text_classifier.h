@@ -17,7 +17,7 @@ namespace ocr {
  */
 struct ClassifierConfig {
     // Model path (default - will be resolved to absolute path)
-    std::string modelPath = std::string(PROJECT_ROOT_DIR) + "/engine/model_files/best/textline_ori.dxnn";
+    std::string modelPath = std::string(PROJECT_ROOT_DIR) + "/engine/model_files/server/textline_ori.dxnn";
     
     // Classification threshold (rotate if score > threshold)
     float threshold = 0.9f;
@@ -32,9 +32,9 @@ struct ClassifierConfig {
     
     void Show() const {
         LOG_INFO("ClassifierConfig:");
-        LOG_INFO("  modelPath=%s", modelPath.c_str());
-        LOG_INFO("  threshold=%.2f", threshold);
-        LOG_INFO("  inputSize=%dx%d", inputWidth, inputHeight);
+        LOG_INFO("  modelPath={}", modelPath);
+        LOG_INFO("  threshold={:.2f}", threshold);
+        LOG_INFO("  inputSize={}x{}", inputWidth, inputHeight);
     }
 };
 

@@ -31,12 +31,12 @@ std::vector<DeepXOCR::TextBox> DBPostProcessor::process(const cv::Mat& pred,
     cv::threshold(pred, bitmap, thresh_, 255, cv::THRESH_BINARY);
     bitmap.convertTo(bitmap, CV_8UC1);
 
-    LOG_DEBUG("Binary threshold: %.2f, bitmap size: %dx%d, non-zero: %d", 
+    LOG_DEBUG("Binary threshold: {:.2f}, bitmap size: {}x{}, non-zero: {}", 
               thresh_, bitmap.cols, bitmap.rows, cv::countNonZero(bitmap));
 
     // 查找轮廓
     auto contours = findContours(bitmap);
-    LOG_DEBUG("Found %zu contours", contours.size());
+    LOG_DEBUG("Found {} contours", contours.size());
 
     // 处理每个轮廓
     int num_contours = std::min(static_cast<int>(contours.size()), max_candidates_);
@@ -213,10 +213,10 @@ std::vector<cv::Point2f> DBPostProcessor::unclip(const std::vector<cv::Point2f>&
     // Debug logging
     static int debug_count = 0;
     if (debug_count < 3) {
-        LOG_DEBUG("Unclip: area=%.2f, length=%.2f, distance=%.2f, solution paths=%zu", 
+        LOG_DEBUG("Unclip: area={:.2f}, length={:.2f}, distance={:.2f}, solution paths={}", 
                  area, length, distance, solution.size());
         if (!solution.empty()) {
-            LOG_DEBUG("  First solution has %zu points", solution[0].size());
+            LOG_DEBUG("  First solution has {} points", solution[0].size());
         }
         debug_count++;
     }

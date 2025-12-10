@@ -22,13 +22,16 @@ struct RecognizerConfig {
     
     // Model paths for different aspect ratios (default paths - will be resolved to absolute paths)
     std::map<int, std::string> modelPaths = {
-        {3, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/best/rec_v5_ratio_3.dxnn"},
-        {5, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/best/rec_v5_ratio_5.dxnn"},
-        {10, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/best/rec_v5_ratio_10.dxnn"},
-        {15, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/best/rec_v5_ratio_15.dxnn"},
-        {25, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/best/rec_v5_ratio_25.dxnn"},
-        {35, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/best/rec_v5_ratio_35.dxnn"}
+        {3, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/server/rec_v5_ratio_3.dxnn"},
+        {5, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/server/rec_v5_ratio_5.dxnn"},
+        {10, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/server/rec_v5_ratio_10.dxnn"},
+        {15, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/server/rec_v5_ratio_15.dxnn"},
+        {25, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/server/rec_v5_ratio_25.dxnn"},
+        {35, std::string(PROJECT_ROOT_DIR) + "/engine/model_files/server/rec_v5_ratio_35.dxnn"}
     };
+    
+    // Use mobile model variant (rec_mobile_* instead of rec_v5_*)
+    bool useMobileModel = false;
     
     // Character dictionary path (default - will be resolved to absolute path)
     std::string dictPath = std::string(PROJECT_ROOT_DIR) + "/engine/model_files/ppocrv5_dict.txt";
@@ -38,9 +41,9 @@ struct RecognizerConfig {
     
     void Show() const {
         LOG_INFO("RecognizerConfig:");
-        LOG_INFO("  confThreshold=%.2f", confThreshold);
-        LOG_INFO("  dictPath=%s", dictPath.c_str());
-        LOG_INFO("  Models: %zu ratios", modelPaths.size());
+        LOG_INFO("  confThreshold={:.2f}", confThreshold);
+        LOG_INFO("  dictPath={}", dictPath);
+        LOG_INFO("  Models: {} ratios", modelPaths.size());
     }
 };
 

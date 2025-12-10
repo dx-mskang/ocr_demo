@@ -16,10 +16,10 @@ static void createDirectory(const std::string& path) {
 
 void DetectorConfig::Show() const {
     LOG_INFO("DetectorConfig:");
-    LOG_INFO("  thresh=%.2f, boxThresh=%.2f, unclipRatio=%.2f",
+    LOG_INFO("  thresh={:.2f}, boxThresh={:.2f}, unclipRatio={:.2f}",
              thresh, boxThresh, unclipRatio);
-    LOG_INFO("  model640=%s", model640Path.c_str());
-    LOG_INFO("  model960=%s", model960Path.c_str());
+    LOG_INFO("  model640={}", model640Path);
+    LOG_INFO("  model960={}", model960Path);
 }
 
 TextDetector::TextDetector(const DetectorConfig& config)
@@ -55,14 +55,14 @@ bool TextDetector::init() {
         if (!config_.model640Path.empty()) {
             model640_ = std::make_unique<dxrt::InferenceEngine>(config_.model640Path);
             model640_->RegisterCallback(cb);
-            LOG_INFO("Loaded det_640 model: %s", config_.model640Path.c_str());
+            LOG_INFO("Loaded det_640 model: {}", config_.model640Path);
         }
         
         // Load 960 model
         if (!config_.model960Path.empty()) {
             model960_ = std::make_unique<dxrt::InferenceEngine>(config_.model960Path);
             model960_->RegisterCallback(cb);
-            LOG_INFO("Loaded det_960 model: %s", config_.model960Path.c_str());
+            LOG_INFO("Loaded det_960 model: {}", config_.model960Path);
         }
 
         if (!model640_ && !model960_) {
@@ -75,7 +75,7 @@ bool TextDetector::init() {
         return true;
 
     } catch (const std::exception& e) {
-        LOG_ERROR("Failed to initialize TextDetector: %s", e.what());
+        LOG_ERROR("Failed to initialize TextDetector: {}", e.what());
         return false;
     }
 }
@@ -97,7 +97,7 @@ std::vector<DeepXOCR::TextBox> TextDetector::detect(const cv::Mat& image) {
     // Select model based on image size
     auto* engine = selectModel(orig_h, orig_w);
     if (!engine) {
-        LOG_ERROR("No suitable model for image size %dx%d", orig_h, orig_w);
+        LOG_ERROR("No suitable model for image size {}x{}", orig_h, orig_w);
         return {};
     }
 
@@ -131,7 +131,7 @@ std::vector<DeepXOCR::TextBox> TextDetector::detect(const cv::Mat& image) {
     last_inference_time_ = inference_time;
     last_postprocess_time_ = postprocess_time;
     
-    LOG_INFO("Detection: %zu boxes | Preprocess: %.2fms | Inference: %.2fms | Postprocess: %.2fms", 
+    LOG_INFO("Detection: {} boxes | Preprocess: {:.2f}ms | Inference: {:.2f}ms | Postprocess: {:.2f}ms", 
              boxes.size(), preprocess_time, inference_time, postprocess_time);
     
     // Save final detection result if enabled
@@ -141,7 +141,7 @@ std::vector<DeepXOCR::TextBox> TextDetector::detect(const cv::Mat& image) {
         Visualizer::drawTextBoxes(vis_image, boxes);
         std::string path = config_.outputDir + "/detection_result.jpg";
         cv::imwrite(path, vis_image);
-        LOG_INFO("Saved detection result: %s", path.c_str());
+        LOG_INFO("Saved detection result: {}", path);
     }
     
     return boxes;
@@ -160,10 +160,10 @@ dxrt::InferenceEngine* TextDetector::selectModel(int height, int width) {
     int max_side = std::max(height, width);
 
     if (max_side < config_.sizeThreshold && model640_) {
-        LOG_DEBUG("Using 640 model for image size %dx%d", height, width);
+        LOG_DEBUG("Using 640 model for image size {}x{}", height, width);
         return model640_.get();
     } else if (model960_) {
-        LOG_DEBUG("Using 960 model for image size %dx%d", height, width);
+        LOG_DEBUG("Using 960 model for image size {}x{}", height, width);
         return model960_.get();
     } else if (model640_) {
         return model640_.get();
@@ -218,7 +218,7 @@ cv::Mat TextDetector::preprocess(const cv::Mat& image, int target_size,
     resized_h = padded.rows;
     resized_w = padded.cols;
     
-    LOG_DEBUG("PPOCR Preprocess: original %dx%d -> padded %dx%d (pad_h=%d, pad_w=%d) -> resized %dx%d",
+    LOG_DEBUG("PPOCR Preprocess: original {}x{} -> padded {}x{} (pad_h={}, pad_w={}) -> resized {}x{}",
               orig_w, orig_h, padded.cols, padded.rows, pad_h, pad_w, target_size, target_size);
     
     return final_image;
@@ -275,7 +275,7 @@ int TextDetector::internalCallback(dxrt::TensorPtrs& outputs, void* userArg) {
     
     auto shape = output_tensor->shape();
     if (shape.size() != 4) {
-        LOG_ERROR("Unexpected output shape size: %zu", shape.size());
+        LOG_ERROR("Unexpected output shape size: {}", shape.size());
         return -1;
     }
 
@@ -317,7 +317,7 @@ cv::Mat TextDetector::runInference(dxrt::InferenceEngine* engine, const cv::Mat&
     auto outputs = engine->Run(reinterpret_cast<void*>(const_cast<uint8_t*>(input_ptr)));
     auto t_end = std::chrono::high_resolution_clock::now();
     double run_time = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    LOG_INFO("Engine Run time: %.2fms", run_time);
+    LOG_INFO("Engine Run time: {:.2f}ms", run_time);
 
     if (outputs.empty()) {
         LOG_ERROR("Inference failed: no output tensors");
@@ -330,7 +330,7 @@ cv::Mat TextDetector::runInference(dxrt::InferenceEngine* engine, const cv::Mat&
     
     // Shape should be [1, 1, H, W] for detection
     if (shape.size() != 4) {
-        LOG_ERROR("Unexpected output shape size: %zu", shape.size());
+        LOG_ERROR("Unexpected output shape size: {}", shape.size());
         return cv::Mat();
     }
 
@@ -344,7 +344,7 @@ cv::Mat TextDetector::runInference(dxrt::InferenceEngine* engine, const cv::Mat&
     // Fast copy: memcpy entire buffer (pred is continuous by construction)
     size_t total = static_cast<size_t>(out_h) * static_cast<size_t>(out_w);
     std::memcpy(pred.data, reinterpret_cast<const void*>(output_data), total * sizeof(float));
-    LOG_DEBUG("Copied %zu floats into cv::Mat via memcpy", total);
+    LOG_DEBUG("Copied {} floats into cv::Mat via memcpy", total);
 
     return pred;
 }

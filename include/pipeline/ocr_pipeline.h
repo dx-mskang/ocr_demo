@@ -128,30 +128,6 @@ public:
      */
     bool initialize();
     
-    /**
-     * @brief 处理单张图片
-     * @param image 输入图片
-     * @param results 输出OCR结果
-     * @param stats 输出性能统计（可选）
-     * @return true表示成功，false表示失败
-     */
-    bool process(const cv::Mat& image, 
-                std::vector<PipelineOCRResult>& results,
-                OCRPipelineStats* stats = nullptr);
-    
-    /**
-     * @brief 处理单张图片（带可视化）
-     * @param image 输入图片
-     * @param results 输出OCR结果
-     * @param visualImage 输出可视化图片
-     * @param stats 输出性能统计（可选）
-     * @return true表示成功，false表示失败
-     */
-    bool processWithVisualization(const cv::Mat& image,
-                                 std::vector<PipelineOCRResult>& results,
-                                 cv::Mat& visualImage,
-                                 OCRPipelineStats* stats = nullptr);
-    
     
     /**
      * @brief 将结果保存为JSON
