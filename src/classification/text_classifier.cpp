@@ -179,4 +179,91 @@ std::pair<std::string, float> TextClassifier::Postprocess(dxrt::TensorPtrs& outp
     return {label, confidence};
 }
 
+// ============== Async Classification ==============
+
+void TextClassifier::RegisterCallback(ClassifyCallback callback) {
+    userCallback_ = callback;
+    
+    // Register internal callback with the engine
+    auto internalCb = [this](dxrt::TensorPtrs& outputs, void* userArg) {
+        return this->internalCallback(outputs, userArg);
+    };
+    
+    engine_->RegisterCallback(internalCb);
+    LOG_DEBUG("Registered async callback for classification model");
+}
+
+int TextClassifier::ClassifyAsync(const cv::Mat& textImage, void* userArg) {
+    if (!initialized_) {
+        LOG_ERROR("TextClassifier not initialized");
+        if (userCallback_) {
+            userCallback_("0", 0.0f, userArg);
+        }
+        return -1;
+    }
+    
+    if (textImage.empty()) {
+        LOG_ERROR("Input image is empty");
+        if (userCallback_) {
+            userCallback_("0", 0.0f, userArg);
+        }
+        return -1;
+    }
+    
+    // Preprocess
+    cv::Mat preprocessed = Preprocess(textImage);
+    if (preprocessed.empty()) {
+        LOG_ERROR("Preprocessing failed");
+        if (userCallback_) {
+            userCallback_("0", 0.0f, userArg);
+        }
+        return -1;
+    }
+    
+    // Ensure continuous memory
+    if (!preprocessed.isContinuous()) {
+        preprocessed = preprocessed.clone();
+    }
+    
+    // Create context - store preprocessed image to keep it alive during async inference
+    ClassificationContext* ctx = new ClassificationContext{preprocessed.clone(), userArg};
+    
+    // Submit async inference
+    engine_->RunAsync(ctx->preprocessed.data, ctx);
+    
+    return 0;
+}
+
+int TextClassifier::internalCallback(dxrt::TensorPtrs& outputs, void* userArg) {
+    ClassificationContext* ctx = static_cast<ClassificationContext*>(userArg);
+    if (!ctx) {
+        // This is expected when synchronous Run() triggers the async callback
+        LOG_DEBUG("Classification callback: null context (sync call, ignoring)");
+        return 0;
+    }
+    
+    // Ensure context is deleted
+    std::unique_ptr<ClassificationContext> ctxGuard(ctx);
+    
+    if (outputs.empty()) {
+        LOG_ERROR("Classification inference failed: no output tensors");
+        if (userCallback_) {
+            userCallback_("0", 0.0f, ctx->userArg);
+        }
+        return -1;
+    }
+    
+    // Postprocess
+    auto [label, confidence] = Postprocess(outputs);
+    
+    LOG_DEBUG("Async classification result: label='{}', conf={:.4f}", label, confidence);
+    
+    // Invoke user callback
+    if (userCallback_) {
+        userCallback_(label, confidence, ctx->userArg);
+    }
+    
+    return 0;
+}
+
 } // namespace ocr

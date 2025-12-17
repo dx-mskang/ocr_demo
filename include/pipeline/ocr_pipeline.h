@@ -7,6 +7,7 @@
 #include "common/types.hpp"
 #include "common/visualizer.h"
 #include "common/concurrent_queue.hpp"
+#include "common/thread_pool.hpp"
 #include <opencv2/opencv.hpp>
 #include <vector>
 #include <string>
@@ -224,10 +225,31 @@ private:
         std::shared_ptr<RecognitionTaskContext> taskCtx;
         size_t cropIndex;
     };
+    
+    // Context for a single crop's async classification (for pipelined cls->rec)
+    struct ClassificationCropContext {
+        std::shared_ptr<RecognitionTaskContext> taskCtx;
+        size_t cropIndex;
+        // Note: crop data is accessed via taskCtx->crops[cropIndex], no need to store separately
+    };
 
     void detectionLoop();
     void recognitionLoop();
+    void onClassificationComplete(const std::string& label, float confidence, void* userArg);
     void onRecognitionComplete(const std::string& text, float confidence, void* userArg);
+    
+    /**
+     * @brief Submit a single crop for recognition (after classification or directly)
+     * @param taskCtx Recognition task context
+     * @param cropIndex Index of the crop to submit
+     */
+    void submitCropForRecognition(std::shared_ptr<RecognitionTaskContext> taskCtx, size_t cropIndex);
+    
+    /**
+     * @brief 完成识别任务的最终处理（排序、过滤、推送结果）
+     * @param taskCtx 识别任务上下文
+     */
+    void finalizeRecognitionTask(std::shared_ptr<RecognitionTaskContext> taskCtx);
 
     std::unique_ptr<ConcurrentQueue<DetectionTask>> detQueue_;
     std::unique_ptr<ConcurrentQueue<RecognitionTask>> recQueue_;
@@ -239,6 +261,10 @@ private:
     
     int numDetectionThreads_;   // Set based on CPU cores
     int numRecognitionThreads_; // Set based on CPU cores
+    
+    // Stage executor: thread pool for dispatching callback work
+    // Similar to Python's ThreadPoolExecutor + _dispatch_stage pattern
+    std::unique_ptr<ThreadPool> stageExecutor_;
     
 private:
     OCRPipelineConfig config_;

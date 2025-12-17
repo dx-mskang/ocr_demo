@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <functional>
 
 #include "common/logger.hpp"
 #include "common/types.hpp"
@@ -44,6 +45,9 @@ struct ClassifierConfig {
  */
 class TextClassifier {
 public:
+    // Callback type for async classification
+    using ClassifyCallback = std::function<void(const std::string& label, float confidence, void* userArg)>;
+    
     TextClassifier() = default;
     explicit TextClassifier(const ClassifierConfig& config);
     ~TextClassifier() = default;
@@ -51,15 +55,29 @@ public:
     // Initialize model
     bool Initialize();
     
-    // Classify single text image
+    // Classify single text image (synchronous)
     // Returns: (label, confidence)
     //   label: "0" (normal) or "180" (needs rotation)
     //   confidence: probability [0, 1]
     std::pair<std::string, float> Classify(const cv::Mat& textImage);
     
-    // Classify batch of text images
+    // Classify batch of text images (synchronous)
     std::vector<std::pair<std::string, float>> ClassifyBatch(
         const std::vector<cv::Mat>& textImages);
+    
+    /**
+     * @brief Register callback for async classification results
+     * @param callback Function to be called when classification completes
+     */
+    void RegisterCallback(ClassifyCallback callback);
+    
+    /**
+     * @brief Classify single text image asynchronously
+     * @param textImage Input text crop image
+     * @param userArg User-provided context passed to callback
+     * @return 0 on success, -1 on error
+     */
+    int ClassifyAsync(const cv::Mat& textImage, void* userArg);
     
     // Check if image needs rotation based on classification result
     bool NeedsRotation(const std::string& label, float confidence) const {
@@ -78,6 +96,18 @@ private:
     std::unique_ptr<dxrt::InferenceEngine> engine_;
     std::vector<std::string> labels_ = {"0", "180"};
     bool initialized_ = false;
+    
+    // Async callback
+    ClassifyCallback userCallback_;
+    
+    // Context for async classification
+    struct ClassificationContext {
+        cv::Mat preprocessed;  // Keep preprocessed image alive during async inference
+        void* userArg;
+    };
+    
+    // Internal callback for dxrt async inference
+    int internalCallback(dxrt::TensorPtrs& outputs, void* userArg);
     
     // Timing details of last batch classification
     double last_preprocess_time_ = 0.0;

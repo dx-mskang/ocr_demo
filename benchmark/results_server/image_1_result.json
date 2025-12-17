@@ -1,0 +1,14 @@
+{
+    "avg_inference_ms": 420.21196349999997,
+    "chars_per_second": 57.11403311819322,
+    "filename": "image_1.png",
+    "fps": 2.3797513799247176,
+    "rec_scores": [
+        0.9590351581573486
+    ],
+    "rec_texts": [
+        "广东省钢铁研究所"
+    ],
+    "runs": 3,
+    "total_chars": 24
+}

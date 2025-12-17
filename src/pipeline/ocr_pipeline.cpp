@@ -131,9 +131,15 @@ OCRPipeline::OCRPipeline(const OCRPipelineConfig& config)
     numDetectionThreads_ = 1;  // Detection uses async callback, 1 is enough
     numRecognitionThreads_ = 1;  // Avoid lock contention
     
+    // Initialize stage executor thread pool (similar to Python's ThreadPoolExecutor)
+    // This is used to dispatch heavy work from DXRT callbacks to separate threads
+    constexpr size_t STAGE_EXECUTOR_THREADS = 8;  // Similar to Python's max_workers=16
+    stageExecutor_ = std::make_unique<ThreadPool>(STAGE_EXECUTOR_THREADS);
+    
     LOG_INFO("OCRPipeline: Detected {} CPU cores", numCores);
     LOG_INFO("  Detection threads: {}", numDetectionThreads_);
     LOG_INFO("  Recognition threads: {}", numRecognitionThreads_);
+    LOG_INFO("  Stage executor threads: {}", STAGE_EXECUTOR_THREADS);
 }
 
 OCRPipeline::~OCRPipeline() {
@@ -151,43 +157,48 @@ bool OCRPipeline::initialize() {
     detector_ = std::make_unique<TextDetector>(config_.detectorConfig);
     
     // Set callback for async mode
+    // Detection callback is kept lightweight - it only dispatches to stageExecutor_
     detector_->setCallback([this](std::vector<DeepXOCR::TextBox> boxes, int64_t taskId, cv::Mat image, double /*pp*/, double /*inf*/, double /*post*/) {
         LOG_INFO("Detection callback: taskId={}, boxes={}", taskId, boxes.size());
         
-        // Sort Boxes
-        std::sort(boxes.begin(), boxes.end(), [](const DeepXOCR::TextBox& a, const DeepXOCR::TextBox& b) {
-            if (std::abs(a.points[0].y - b.points[0].y) < 1.0f) {
-                return a.points[0].x < b.points[0].x;
-            }
-            return a.points[0].y < b.points[0].y;
-        });
-        
-        for (size_t i = 0; i < boxes.size() - 1; ++i) {
-            for (int j = i; j >= 0; --j) {
-                if (std::abs(boxes[j + 1].points[0].y - boxes[j].points[0].y) < 10.0f &&
-                    boxes[j + 1].points[0].x < boxes[j].points[0].x) {
-                    std::swap(boxes[j], boxes[j + 1]);
-                } else {
-                    break;
+        // Dispatch heavy work (sorting, queue push) to stageExecutor_
+        // This avoids blocking DXRT internal callback thread
+        stageExecutor_->dispatch([this, boxes = std::move(boxes), taskId, image]() mutable {
+            // Sort Boxes
+            std::sort(boxes.begin(), boxes.end(), [](const DeepXOCR::TextBox& a, const DeepXOCR::TextBox& b) {
+                if (std::abs(a.points[0].y - b.points[0].y) < 1.0f) {
+                    return a.points[0].x < b.points[0].x;
+                }
+                return a.points[0].y < b.points[0].y;
+            });
+            
+            for (size_t i = 0; i < boxes.size() - 1; ++i) {
+                for (int j = i; j >= 0; --j) {
+                    if (std::abs(boxes[j + 1].points[0].y - boxes[j].points[0].y) < 10.0f &&
+                        boxes[j + 1].points[0].x < boxes[j].points[0].x) {
+                        std::swap(boxes[j], boxes[j + 1]);
+                    } else {
+                        break;
+                    }
                 }
             }
-        }
 
-        // Push to Recognition Queue (non-blocking to avoid deadlock)
-        // Check both running_ and recQueue_ existence atomically
-        if (running_ && recQueue_) {
-            size_t boxCount = boxes.size();
-            RecognitionTask task{image, std::move(boxes), taskId};
-            // Use try_push with longer timeout to avoid blocking callback threads
-            while (running_ && recQueue_ && !recQueue_->try_push(std::move(task), std::chrono::milliseconds(500))) {
-                LOG_WARN("Recognition queue full, waiting... id={}", taskId);
-            }
+            // Push to Recognition Queue (non-blocking to avoid deadlock)
+            // Check both running_ and recQueue_ existence atomically
             if (running_ && recQueue_) {
-                LOG_INFO("Pushed task to recognition queue, id={}, boxes={}", taskId, boxCount);
+                size_t boxCount = boxes.size();
+                RecognitionTask task{image, std::move(boxes), taskId};
+                // Use try_push with longer timeout to avoid blocking callback threads
+                while (running_ && recQueue_ && !recQueue_->try_push(std::move(task), std::chrono::milliseconds(500))) {
+                    LOG_WARN("Recognition queue full, waiting... id={}", taskId);
+                }
+                if (running_ && recQueue_) {
+                    LOG_INFO("Pushed task to recognition queue, id={}, boxes={}", taskId, boxCount);
+                }
+            } else {
+                LOG_WARN("Pipeline stopping, discarding detection callback for taskId={}", taskId);
             }
-        } else {
-            LOG_WARN("Pipeline stopping, discarding detection callback for taskId={}", taskId);
-        }
+        });
     });
 
     if (!detector_->init()) {
@@ -215,7 +226,11 @@ bool OCRPipeline::initialize() {
             LOG_ERROR("Failed to initialize TextClassifier");
             return false;
         }
-        LOG_INFO("Text Classifier enabled");
+        // Register async callback for classification (for pipelined cls->rec)
+        classifier_->RegisterCallback([this](const std::string& label, float confidence, void* userArg) {
+            this->onClassificationComplete(label, confidence, userArg);
+        });
+        LOG_INFO("Text Classifier enabled with async callback");
     } else {
         LOG_INFO("Text Classifier disabled");
     }
@@ -457,124 +472,176 @@ void OCRPipeline::recognitionLoop() {
             continue;
         }
 
-        // Prepare crops and box points
-        std::vector<cv::Mat> crops;
-        std::vector<std::vector<cv::Point2f>> box_points_list;
-        crops.reserve(task.boxes.size());
-        box_points_list.reserve(task.boxes.size());
+        // ============================================================
+        // OPTIMIZATION: Interleaved Crop & Submit
+        // Instead of: [crop all] → [submit all]
+        // Now:        [crop 1 → submit 1] → [crop 2 → submit 2] → ...
+        // This allows NPU to start processing while CPU continues cropping
+        // ============================================================
+        
+        size_t validBoxCount = task.boxes.size();
+        auto taskCtx = std::make_shared<RecognitionTaskContext>(task.id, validBoxCount);
+        taskCtx->processedImage = task.image.clone();  // 保存处理后的图像用于可视化
+        
+        LOG_INFO("Starting interleaved crop & submit for {} boxes, id={}, cls={}", 
+                 validBoxCount, task.id, 
+                 config_.useClassification ? "async" : "disabled");
 
+        // Crop and submit immediately (interleaved)
+        // Each crop is submitted to NPU right after it's created
+        size_t actualCropIndex = 0;
+        size_t failedCrops = 0;
+        
         for (size_t i = 0; i < task.boxes.size(); ++i) {
             std::vector<cv::Point2f> box_points(4);
             for (int j = 0; j < 4; ++j) box_points[j] = task.boxes[i].points[j];
             
+            // Crop this single box
             cv::Mat textImage = Geometry::getRotateCropImage(task.image, box_points);
-            if (textImage.empty()) continue;
             
-            crops.push_back(textImage);
-            box_points_list.push_back(box_points);
-        }
-
-        if (crops.empty()) {
-            // All crops failed
-            if (outQueue_) {
-                outQueue_->push({std::vector<PipelineOCRResult>{}, task.image, task.id});
-                LOG_INFO("Pushed empty result (no valid crops) to output queue, id={}", task.id);
-            }
-            continue;
-        }
-
-        // Classification (still sync for now - could be async in future)
-        if (config_.useClassification && classifier_) {
-            auto cls_results = classifier_->ClassifyBatch(crops);
-            for (size_t i = 0; i < crops.size() && i < cls_results.size(); ++i) {
-                auto [label, confidence] = cls_results[i];
-                if (classifier_->NeedsRotation(label, confidence)) {
-                    cv::rotate(crops[i], crops[i], cv::ROTATE_180);
+            if (textImage.empty()) {
+                // This crop failed, decrement pending count
+                ++failedCrops;
+                int remaining = taskCtx->pendingCount.fetch_sub(1) - 1;
+                LOG_DEBUG("Crop {} failed (empty), remaining pending={}", i, remaining);
+                
+                // Check if all "crops" have been processed (all failed)
+                if (remaining == 0) {
+                    finalizeRecognitionTask(taskCtx);
                 }
+                continue;
             }
+            
+            // Store crop and box points in context
+            taskCtx->crops[actualCropIndex] = std::move(textImage);
+            taskCtx->boxPoints[actualCropIndex] = std::move(box_points);
+            taskCtx->results[actualCropIndex].box = taskCtx->boxPoints[actualCropIndex];
+            taskCtx->results[actualCropIndex].index = static_cast<int>(actualCropIndex);
+            
+            // IMMEDIATELY submit to classification/recognition pipeline
+            // NPU starts processing while CPU continues to crop next box
+            if (config_.useClassification && classifier_) {
+                ClassificationCropContext* clsCtx = new ClassificationCropContext{taskCtx, actualCropIndex};
+                classifier_->ClassifyAsync(taskCtx->crops[actualCropIndex], clsCtx);
+            } else {
+                submitCropForRecognition(taskCtx, actualCropIndex);
+            }
+            
+            ++actualCropIndex;
         }
-
-        // Create task context for async recognition
-        auto taskCtx = std::make_shared<RecognitionTaskContext>(task.id, crops.size());
-        taskCtx->processedImage = task.image.clone();  // 保存处理后的图像用于可视化
         
-        // Copy crops and box points to context (keep crops alive during async inference)
-        for (size_t i = 0; i < crops.size(); ++i) {
-            taskCtx->crops[i] = crops[i].clone();  // Clone to ensure data stays valid
-            taskCtx->boxPoints[i] = box_points_list[i];
-            // Pre-initialize result with box info
-            taskCtx->results[i].box = box_points_list[i];
-            taskCtx->results[i].index = static_cast<int>(i);
-        }
-
-        LOG_INFO("Submitting {} crops for async recognition, id={}", crops.size(), task.id);
-
-        // Submit all crops for async recognition
-        for (size_t i = 0; i < crops.size(); ++i) {
-            // Create per-crop context (will be deleted by callback)
-            RecognitionCropContext* cropCtx = new RecognitionCropContext{taskCtx, i};
-            recognizer_->RecognizeAsync(taskCtx->crops[i], cropCtx);  // Use cloned crop from context
-        }
+        LOG_DEBUG("Interleaved submission complete: {} valid crops, {} failed, id={}", 
+                  actualCropIndex, failedCrops, task.id);
     }
+}
+
+// Helper: Submit a single crop for recognition (after classification or directly)
+void OCRPipeline::submitCropForRecognition(std::shared_ptr<RecognitionTaskContext> taskCtx, size_t cropIndex) {
+    const cv::Mat& crop = taskCtx->crops[cropIndex];
+    
+    // Submit async recognition (model will handle all ratios including long text via ratio_35)
+    RecognitionCropContext* cropCtx = new RecognitionCropContext{taskCtx, cropIndex};
+    recognizer_->RecognizeAsync(crop, cropCtx);
+}
+
+void OCRPipeline::onClassificationComplete(const std::string& label, float confidence, void* userArg) {
+    ClassificationCropContext* clsCtx = static_cast<ClassificationCropContext*>(userArg);
+    if (!clsCtx) {
+        LOG_DEBUG("Classification callback: null context (sync call, ignoring)");
+        return;
+    }
+    
+    // Extract context data (lightweight)
+    auto taskCtx = clsCtx->taskCtx;  // shared_ptr copy
+    size_t idx = clsCtx->cropIndex;
+    bool needsRotation = classifier_->NeedsRotation(label, confidence);
+    
+    // Clean up the raw pointer
+    delete clsCtx;
+    
+    LOG_DEBUG("Classification complete for crop {} of task {}, label='{}', conf={:.3f}",
+              idx, taskCtx->taskId, label, confidence);
+    
+    // Dispatch heavy work to thread pool (similar to Python's _dispatch_stage)
+    // This avoids blocking DXRT internal callback thread
+    stageExecutor_->dispatch([this, taskCtx, idx, needsRotation]() {
+        // Rotate image if needed (in-place on taskCtx->crops)
+        if (needsRotation) {
+            cv::rotate(taskCtx->crops[idx], taskCtx->crops[idx], cv::ROTATE_180);
+            LOG_DEBUG("Rotated crop {} by 180 degrees", idx);
+        }
+        
+        // Submit to recognition (pipelined)
+        submitCropForRecognition(taskCtx, idx);
+    });
 }
 
 void OCRPipeline::onRecognitionComplete(const std::string& text, float confidence, void* userArg) {
     RecognitionCropContext* cropCtx = static_cast<RecognitionCropContext*>(userArg);
     if (!cropCtx) {
-        LOG_ERROR("Recognition callback: null crop context");
+        LOG_DEBUG("Recognition callback: null crop context (sync call, ignoring)");
         return;
     }
 
-    // Take ownership of crop context
-    std::unique_ptr<RecognitionCropContext> cropCtxGuard(cropCtx);
-    
-    auto& taskCtx = cropCtx->taskCtx;
+    // Extract context data (lightweight)
+    auto taskCtx = cropCtx->taskCtx;  // shared_ptr copy
     size_t idx = cropCtx->cropIndex;
+    std::string textCopy = text;  // Copy text for dispatch
+    
+    // Clean up the raw pointer
+    delete cropCtx;
 
-    // Update result for this crop
-    {
-        std::lock_guard<std::mutex> lock(taskCtx->resultMutex);
-        taskCtx->results[idx].text = text;
-        taskCtx->results[idx].confidence = confidence;
+    // Dispatch to thread pool to avoid blocking DXRT callback thread
+    stageExecutor_->dispatch([this, taskCtx, idx, textCopy = std::move(textCopy), confidence]() {
+        // Update result for this crop
+        {
+            std::lock_guard<std::mutex> lock(taskCtx->resultMutex);
+            taskCtx->results[idx].text = textCopy;
+            taskCtx->results[idx].confidence = confidence;
+        }
+
+        // Decrement pending count
+        int remaining = taskCtx->pendingCount.fetch_sub(1) - 1;
+        
+        LOG_DEBUG("Recognition complete for crop {} of task {}, remaining={}, text='{}'",
+                  idx, taskCtx->taskId, remaining, textCopy.empty() ? "<empty>" : textCopy.substr(0, 20));
+
+        // If all crops done, finalize and output
+        if (remaining == 0) {
+            finalizeRecognitionTask(taskCtx);
+        }
+    });
+}
+
+void OCRPipeline::finalizeRecognitionTask(std::shared_ptr<RecognitionTaskContext> taskCtx) {
+    // Collect valid results (non-empty text)
+    std::vector<PipelineOCRResult> validResults;
+    validResults.reserve(taskCtx->results.size());
+    
+    for (const auto& res : taskCtx->results) {
+        if (!res.text.empty()) {
+            validResults.push_back(res);
+        }
     }
 
-    // Decrement pending count
-    int remaining = taskCtx->pendingCount.fetch_sub(1) - 1;
-    
-    LOG_DEBUG("Recognition complete for crop {} of task {}, remaining={}, text='{}'",
-              idx, taskCtx->taskId, remaining, text.empty() ? "<empty>" : text.substr(0, 20));
-
-    // If all crops done, finalize and output
-    if (remaining == 0) {
-        // Collect valid results (non-empty text)
-        std::vector<PipelineOCRResult> validResults;
-        validResults.reserve(taskCtx->results.size());
-        
-        for (const auto& res : taskCtx->results) {
-            if (!res.text.empty()) {
-                validResults.push_back(res);
-            }
+    // Sort results
+    if (config_.sortResults && !validResults.empty()) {
+        sortOCRResults(validResults);
+        for (size_t i = 0; i < validResults.size(); ++i) {
+            validResults[i].index = static_cast<int>(i);
         }
+    }
 
-        // Sort results
-        if (config_.sortResults && !validResults.empty()) {
-            sortOCRResults(validResults);
-            for (size_t i = 0; i < validResults.size(); ++i) {
-                validResults[i].index = static_cast<int>(i);
-            }
+    // Push to output queue (use try_push to avoid deadlock)
+    if (outQueue_ && running_) {
+        size_t resultCount = validResults.size();  // Save before move
+        while (running_ && !outQueue_->try_push({std::move(validResults), taskCtx->processedImage, taskCtx->taskId}, 
+                                                 std::chrono::milliseconds(500))) {
+            LOG_WARN("Output queue full, waiting... id={}", taskCtx->taskId);
         }
-
-        // Push to output queue (use try_push to avoid deadlock)
-        if (outQueue_ && running_) {
-            size_t resultCount = validResults.size();  // Save before move
-            while (running_ && !outQueue_->try_push({std::move(validResults), taskCtx->processedImage, taskCtx->taskId}, 
-                                                     std::chrono::milliseconds(500))) {
-                LOG_WARN("Output queue full, waiting... id={}", taskCtx->taskId);
-            }
-            if (running_) {
-                LOG_INFO("Pushed result to output queue, id={}, results={}", 
-                         taskCtx->taskId, resultCount);
-            }
+        if (running_) {
+            LOG_INFO("Pushed result to output queue, id={}, results={}", 
+                     taskCtx->taskId, resultCount);
         }
     }
 }

@@ -1,8 +1,10 @@
 #include "recognition/text_recognizer.h"
 #include "recognition/rec_postprocess.h"
 #include "preprocessing/image_ops.h"
+#include "common/geometry.h"
 #include "common/logger.hpp"
 #include <algorithm>
+#include <cmath>
 
 namespace DeepXOCR {
 
@@ -337,8 +339,10 @@ int TextRecognizer::RecognizeAsync(const cv::Mat& textImage, void* userArg) {
 int TextRecognizer::internalCallback(dxrt::TensorPtrs& outputs, void* userArg) {
     RecognitionContext* ctx = static_cast<RecognitionContext*>(userArg);
     if (!ctx) {
-        LOG_ERROR("Recognition callback: null context");
-        return -1;
+        // This is expected when synchronous Run() triggers the async callback
+        // Sync calls handle results directly from Run() return value
+        LOG_DEBUG("Recognition callback: null context (sync call, ignoring)");
+        return 0;  // Return success, not error
     }
     
     // Ensure context is deleted
