@@ -3,25 +3,27 @@
 #include "common/logger.hpp"
 #include <crow.h>
 #include <nlohmann/json.hpp>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <getopt.h>
 #include <memory>
 #include <string>
-#include <filesystem>
-#include <getopt.h>
 
 using json = nlohmann::json;
 using namespace ocr_server;
 
+
 /**
  * @brief 加载OCR Pipeline配置
+ * @param useMobileModel 是否使用 mobile 模型
  */
-ocr::OCRPipelineConfig LoadDefaultConfig() {
+ocr::OCRPipelineConfig LoadPipelineConfig(bool useMobileModel) {
     ocr::OCRPipelineConfig config;
     
-    // 注意：实际的配置结构与之前假设的不同
-    // 这里只设置最基本的配置，其他使用默认值
-    
-    // Detection配置
-    // config.detectorConfig 使用默认值
+    // 设置模型类型
+    config.detectorConfig.useMobileModel = useMobileModel;
+    config.recognizerConfig.useMobileModel = useMobileModel;
     
     // Document Preprocessing配置
     config.docPreprocessingConfig.useOrientation = true;
@@ -32,6 +34,12 @@ ocr::OCRPipelineConfig LoadDefaultConfig() {
     config.useClassification = true;
     config.enableVisualization = true;
     config.sortResults = true;
+    
+    if (useMobileModel) {
+        LOG_INFO("Using MOBILE models");
+    } else {
+        LOG_INFO("Using SERVER models");
+    }
     
     return config;
 }
@@ -76,19 +84,20 @@ struct AuthMiddleware : crow::ILocalMiddleware {
 };
 
 int main(int argc, char* argv[]) {
-    // 初始化日志
-    LOG_INFO("========== DeepX OCR Server Starting ==========");
-    
     // 默认参数
     int port = 8080;
     int threads = 4;
     std::string vis_dir = "output/vis";
+    std::string model_type = "server";
+    std::string log_dir = "logs";  // 默认日志目录
     
     // 定义长选项
     static struct option long_options[] = {
         {"port",     required_argument, 0, 'p'},
         {"threads",  required_argument, 0, 't'},
         {"vis-dir",  required_argument, 0, 'v'},
+        {"model",    required_argument, 0, 'm'},
+        {"log-dir",  required_argument, 0, 'l'},
         {"help",     no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -96,7 +105,7 @@ int main(int argc, char* argv[]) {
     // 解析命令行参数
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "p:t:v:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:t:v:m:l:h", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 port = std::stoi(optarg);
@@ -107,12 +116,24 @@ int main(int argc, char* argv[]) {
             case 'v':
                 vis_dir = optarg;
                 break;
+            case 'm':
+                model_type = optarg;
+                if (model_type != "server" && model_type != "mobile") {
+                    std::cerr << "Error: model must be 'server' or 'mobile'\n";
+                    return 1;
+                }
+                break;
+            case 'l':
+                log_dir = optarg;
+                break;
             case 'h':
                 std::cout << "Usage: " << argv[0] << " [options]\n"
                           << "Options:\n"
                           << "  -p, --port <port>        Server port (default: 8080)\n"
                           << "  -t, --threads <num>      Number of threads (default: 4)\n"
                           << "  -v, --vis-dir <path>     Visualization output directory (default: output/vis)\n"
+                          << "  -m, --model <type>       Model type: 'server' or 'mobile' (default: server)\n"
+                          << "  -l, --log-dir <path>     Log directory (default: logs)\n"
                           << "  -h, --help               Show this help message\n";
                 return 0;
             default:
@@ -121,13 +142,28 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    // 创建日志目录并初始化 Logger
+    std::filesystem::create_directories(log_dir);
+    DeepXOCR::LoggerConfig logConfig;
+    logConfig.logDir = log_dir;
+    try {
+        DeepXOCR::InitLogger(logConfig);
+    } catch (const spdlog::spdlog_ex& ex) {
+        throw;
+    }
+    
+    // 初始化日志
+    LOG_INFO("========== DeepX OCR Server Starting ==========");
+    LOG_INFO("Log directory: {}", log_dir);
+    
     // 创建可视化输出目录
     std::filesystem::create_directories(vis_dir);
     LOG_INFO("Visualization output directory: {}", vis_dir);
     
     // 加载OCR Pipeline配置
     LOG_INFO("Loading OCR Pipeline configuration...");
-    auto pipeline_config = LoadDefaultConfig();
+    bool useMobileModel = (model_type == "mobile");
+    auto pipeline_config = LoadPipelineConfig(useMobileModel);
     pipeline_config.Show();
     
     // 创建OCR Handler
@@ -201,7 +237,8 @@ int main(int argc, char* argv[]) {
     });
     
     // 静态文件服务（用于访问可视化图片）
-    CROW_ROUTE(app, "/static/vis/<string>")
+    // 注意：使用 <path> 而不是 <string> 以匹配包含点号的文件名
+    CROW_ROUTE(app, "/static/vis/<path>")
     ([vis_dir](std::string filename) {
         std::string filepath = vis_dir + "/" + filename;
         
@@ -211,9 +248,23 @@ int main(int argc, char* argv[]) {
             return crow::response(404, "File not found");
         }
         
-        // 读取并返回文件
-        auto res = crow::response();
-        res.set_static_file_info(filepath);
+        // 手动读取文件并返回（不使用 set_static_file_info，因为它对绝对路径支持有问题）
+        std::ifstream file(filepath, std::ios::binary);
+        if (!file) {
+            LOG_ERROR("Failed to open file: {}", filepath);
+            return crow::response(500, "Failed to open file");
+        }
+        
+        // 读取文件内容
+        std::ostringstream oss;
+        oss << file.rdbuf();
+        std::string content = oss.str();
+        
+        // 创建响应
+        crow::response res(200, content);
+        res.set_header("Content-Type", "image/jpeg");
+        res.set_header("Content-Length", std::to_string(content.size()));
+        
         return res;
     });
     

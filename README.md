@@ -32,9 +32,8 @@
 ### 1. Clone & Initialize
 ```bash
 # Clone the repository and initialize submodules
-git clone --recursive https://github.com/Chris-godz/ocr_demo.git
-git checkout cppinfer
-cd ocr_demo
+git clone --recursive git@github.com:Chris-godz/DEEPX-OCR.git
+cd DEEPX-OCR
 ```
 
 ### 2. Install Dependencies
@@ -108,16 +107,25 @@ OCR/
 │   ├── 📦 clipper2            # Polygon Clipping
 │   ├── 📦 spdlog              # Logging
 │   ├── 📦 opencv              # Computer Vision
-│   └── 📦 opencv_contrib      # Extra Modules (freetype)
-├── 📂 engine/model_files/     # Model Weights
+│   ├── 📦 opencv_contrib      # Extra Modules (freetype)
+│   ├── 📦 crow                # HTTP Framework
+│   ├── 📦 pdfium              # PDF Rendering
+│   ├── 📦 cpp-base64          # Base64 Encoding
+│   └── 📦 googletest          # Unit Testing Framework
+├── 📂 engine/model_files      # Model Weights
 │   ├── 📂 server/             # High-Accuracy Models
 │   └── 📂 mobile/             # Lightweight Models
+├── 📂 server/                 # HTTP Server
+│   ├── 📂 benchmark/          # API Benchmark
+│   ├── 📂 tests/              # Server Tests
+│   └── 📂 webui/              # Web Interface
 ├── 📂 benchmark/              # Performance Benchmarking
 ├── 📂 test/                   # Unit & Integration Tests
 ├── 📂 docs/                   # Documentation
 ├── 📜 build.sh                # Build Script
 ├── 📜 run.sh                  # Interactive Runner
-└── 📜 setup.sh                # Model Setup Script
+├── 📜 setup.sh                # Model Setup Script
+└── 📜 set_env.sh              # Environment Setup
 ```
 
 ---
@@ -149,7 +157,9 @@ python3 benchmark/run_benchmark.py --model mobile
 
 ### 📊 Benchmark Reports (Summary)
 
-**Test Configuration** (from `docs/result/` reports):
+#### x86 Platform
+
+**Test Configuration** (from `docs/result/x86/` reports):
 - Model: PP-OCR v5 (DEEPX NPU acceleration)
 - Dataset Size: 20 images
 - Success Rate: 100% (20/20)
@@ -171,9 +181,30 @@ python3 benchmark/run_benchmark.py --model mobile
 **Detailed Reports**:
 | Setup | Server | Mobile |
 |---|---|---|
-| Single Card | [Report](docs/result/DXNN-OCR_benchmark_report_singlecard_server.md) | [Report](docs/result/DXNN-OCR_benchmark_report_singlecard_mobile.md) |
-| Dual Cards | [Report](docs/result/DXNN-OCR_benchmark_report_dualcards_server.md) | [Report](docs/result/DXNN-OCR_benchmark_report_dualcards_mobile.md) |
-| Three Cards | [Report](docs/result/DXNN-OCR_benchmark_report_threecards_server.md) | [Report](docs/result/DXNN-OCR_benchmark_report_threecards_mobile.md) |
+| Single Card | [Report](docs/result/x86/DXNN-OCR_benchmark_report_singlecard_server.md) | [Report](docs/result/x86/DXNN-OCR_benchmark_report_singlecard_mobile.md) |
+| Dual Cards | [Report](docs/result/x86/DXNN-OCR_benchmark_report_dualcards_server.md) | [Report](docs/result/x86/DXNN-OCR_benchmark_report_dualcards_mobile.md) |
+| Three Cards | [Report](docs/result/x86/DXNN-OCR_benchmark_report_threecards_server.md) | [Report](docs/result/x86/DXNN-OCR_benchmark_report_threecards_mobile.md) |
+
+---
+
+#### ARM Platform (Rockchip aarch64)
+
+**Test Configuration** (from `docs/result/arm/` reports):
+- Model: PP-OCR v5 (DEEPX NPU acceleration)
+- Dataset Size: 20 images
+- Success Rate: 100% (20/20)
+
+**Performance Summary**:
+| Model | Avg Inference Time (ms) | Avg FPS | Avg CPS (chars/s) | Avg Character Accuracy |
+|---|---:|---:|---:|---:|
+| Server | 133.88 | 7.47 | 245.74 | 96.82% |
+| Mobile | 60.00 | 16.67 | 524.96 | 89.37% |
+
+**Detailed Reports**:
+| Model | Report |
+|---|---|
+| Server | [Report](docs/result/arm/DXNN-OCR_benchmark_report_server.md) |
+| Mobile | [Report](docs/result/arm/DXNN-OCR_benchmark_report_mobile.md) |
 
 <details>
 <summary><b>🔄 Reproduce Benchmark Results</b></summary>
@@ -209,3 +240,28 @@ python3 benchmark/run_benchmark.py --model mobile --runs 60 \
 | `--no-cpp` | Skip C++ benchmark (use existing results) | - |
 
 </details>
+
+---
+
+## 🌐 OCR Server
+
+```bash
+cd server
+./run_server.sh                    # Default: port 8080, server model
+```
+
+---
+
+## 🖥️ WebUI Demo
+
+```bash
+cd server/webui
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+![WebUI 主界面全貌](docs/images/image_web.png)
+
+
+**Access**: http://localhost:7860
